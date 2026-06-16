@@ -427,7 +427,9 @@ def _now_ist_parts() -> dict:
 def _auth_db_target() -> str:
     direct = (os.getenv("AUTH_DB_URL") or "").strip()
     if direct:
-        return direct
+        from auth_db import normalize_postgres_dsn
+
+        return normalize_postgres_dsn(direct)
     host = (os.getenv("DB_HOST") or "").strip()
     port = (os.getenv("DB_PORT") or "5432").strip()
     name = (os.getenv("DB_NAME") or "").strip()
@@ -1643,7 +1645,28 @@ def _runtime_core_checks() -> dict:
         "data_dir_exists": DATA_DIR.exists(),
         "data_file_parent_writable": DATA_FILE.parent.exists() and os.access(DATA_FILE.parent, os.W_OK),
         "hr_code_file_exists": HR_ACCESS_CODE_FILE.exists(),
+        "database_connected": _auth_db_ping(),
+        "database_backend": "postgresql" if str(AUTH_DB_TARGET).startswith(("postgresql://", "postgres://")) else "sqlite",
     }
+
+
+def _auth_db_ping() -> bool:
+    try:
+        from auth_db import _connect_postgres, _is_postgres
+
+        if _is_postgres(AUTH_DB_TARGET):
+            with _connect_postgres(str(AUTH_DB_TARGET)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return True
+        import sqlite3
+
+        with sqlite3.connect(str(AUTH_DB_TARGET)) as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
 
 
 def _openai_keys_status() -> dict:
@@ -2236,6 +2259,7 @@ DATA_FILE = HR_RECORDS_FILE
 
 ensure_project_dirs()
 migrate_legacy_data_files()
+_auth_db_url_configured = bool((os.getenv("AUTH_DB_URL") or "").strip())
 AUTH_DB_TARGET = _auth_db_target()
 try:
     init_auth_db(AUTH_DB_TARGET)
@@ -2244,6 +2268,8 @@ except Exception as err:
         "auth.db.init.failed",
         extra={"event": "auth.db.init.failed", "target": str(AUTH_DB_TARGET), "error": str(err)},
     )
+    if _auth_db_url_configured:
+        raise
     AUTH_DB_TARGET = KARNEX_DB_FILE
     init_auth_db(AUTH_DB_TARGET)
 try:

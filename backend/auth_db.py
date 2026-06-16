@@ -90,6 +90,20 @@ def _is_postgres(db_target: DbTarget) -> bool:
     return s.startswith("postgresql://") or s.startswith("postgres://")
 
 
+def normalize_postgres_dsn(dsn: str) -> str:
+    """Ensure SSL for cloud Postgres (Render, etc.) when not localhost."""
+    raw = (dsn or "").strip()
+    if not raw or not _is_postgres(raw):
+        return raw
+    if "sslmode=" in raw:
+        return raw
+    host = (urlparse(raw).hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "postgres"}:
+        return raw
+    sep = "&" if "?" in raw else "?"
+    return f"{raw}{sep}sslmode=require"
+
+
 def _connect_sqlite(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

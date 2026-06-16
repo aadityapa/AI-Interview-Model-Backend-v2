@@ -30,8 +30,10 @@ Or use **New → Blueprint** and upload `render.yaml` from this repo.
 3. Set env var on the web service:
 
 ```
-AUTH_DB_URL=postgresql://user:pass@host/dbname
+AUTH_DB_URL=postgresql://user:pass@host/dbname?sslmode=require
 ```
+
+Use the **Internal Database URL** from Render when the web service and Postgres are in the same region (faster). Append `?sslmode=require` if connecting via the external hostname.
 
 ## 4. Required environment variables
 
