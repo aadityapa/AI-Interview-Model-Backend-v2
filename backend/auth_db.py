@@ -218,6 +218,9 @@ def close_postgres_pools() -> None:
 
 def _ensure_postgres_database(dsn: str) -> None:
     parsed = urlparse(dsn)
+    host = (parsed.hostname or "").lower()
+    if "supabase.com" in host or "pooler.supabase.com" in host:
+        return
     db_name = (parsed.path or "").lstrip("/")
     if not db_name:
         return

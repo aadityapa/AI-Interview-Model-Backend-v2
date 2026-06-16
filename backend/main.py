@@ -137,7 +137,7 @@ from hr.repository import (
     upsert_hr_record,
     upsert_hr_record_async,
 )
-from email_smtp import send_interview_invite_email, smtp_configured, smtp_enabled
+from email_smtp import send_interview_invite_email, smtp_configured
 from hr.service import (
     build_hr_records_summary,
     build_report_record,
@@ -6577,8 +6577,8 @@ def hr_schedule_interview(
             email_sent = bool(mail_res.get("ok"))
             if not email_sent:
                 email_error = str(mail_res.get("error") or "Send failed")
-        elif smtp_enabled():
-            email_error = "SMTP enabled but not configured (set SMTP_HOST, SMTP_USER, SMTP_PASSWORD)."
+        else:
+            email_error = "SMTP not configured (set SMTP_HOST, SMTP_USER, SMTP_PASSWORD in .env)."
 
     out: dict = {
         "status": "ok",

@@ -1,4 +1,4 @@
-# Render Blueprint — backend API only (split frontend repo).
+# Render Blueprint — backend API only (Supabase Postgres external; no Render DB).
 # Docs: docs/RENDER_DEPLOYMENT.md
 
 services:
@@ -15,27 +15,27 @@ services:
         value: "true"
       - key: PROMPT_LOG_FILE_ENABLED
         value: "false"
-      - key: ALLOW_PUBLIC_HR_REGISTRATION
+      - key: SMTP_ENABLED
         value: "false"
+      - key: ALLOW_PUBLIC_HR_REGISTRATION
+        value: "true"
       - key: AUTH_SECRET
         generateValue: true
       - key: REPORT_CODE
         generateValue: true
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_API_KEY_TTS
+        sync: false
+      - key: OPENAI_API_KEY_QUESTIONS
+        sync: false
+      - key: OPENAI_API_KEY_EVALUATION
+        sync: false
+      - key: OPENAI_API_KEY_TRANSCRIBE
+        sync: false
       - key: AUTH_DB_URL
-        fromDatabase:
-          name: karnex-db
-          property: connectionString
+        sync: false
       - key: CORS_ALLOW_ORIGINS
         sync: false
       - key: PUBLIC_BASE_URL
         sync: false
-      - key: SMTP_ENABLED
-        value: "false"
-
-databases:
-  - name: karnex-db
-    plan: free
-    databaseName: karnex_db
-    user: karnex_user

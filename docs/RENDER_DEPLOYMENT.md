@@ -1,74 +1,58 @@
-# Deploy Backend on Render
+# Deploy Backend on Render (Supabase database)
 
 Repo: [AI-Interview-Model-Backend-v2](https://github.com/aadityapa/AI-Interview-Model-Backend-v2)
 
-This backend is **API-only** on Render. The UI lives in the separate frontend repo (`AI-Interview-Model-F-V2`).
+- **Backend:** Render Web Service (Docker)
+- **Database:** [Supabase](https://supabase.com) PostgreSQL (not Render Postgres)
+- **Frontend:** Vercel — `https://ai-interview-model-frontend-v2.vercel.app`
 
-## 1. Push code to GitHub
-
-```bat
-cd D:\AI-Interview-Model-B-V2
-git remote set-url origin https://github.com/aadityapa/AI-Interview-Model-Backend-v2.git
-git push -u origin main
-```
-
-## 2. Create Render Web Service
+## 1. Render Web Service
 
 1. [Render Dashboard](https://dashboard.render.com/) → **New** → **Web Service**
-2. Connect GitHub repo `aadityapa/AI-Interview-Model-Backend-v2`
-3. Settings:
-   - **Runtime:** Docker
-   - **Branch:** `main`
-   - **Health Check Path:** `/health/live`
+2. Connect `aadityapa/AI-Interview-Model-Backend-v2`
+3. **Runtime:** Docker · **Health check:** `/health/live`
+4. Do **not** add a Render PostgreSQL instance.
 
-Or use **New → Blueprint** and upload `render.yaml` from this repo.
+## 2. Supabase connection string
 
-## 3. Add PostgreSQL
+In Supabase: **Project Settings → Database → Connection string → URI** (Session pooler, port 5432).
 
-1. **New → PostgreSQL** (free tier) or use the `karnex-db` database from the Blueprint
-2. Copy the **Internal Database URL**
-3. Set env var on the web service:
+Set on Render as `AUTH_DB_URL` (paste your full URI). Example shape:
 
 ```
-AUTH_DB_URL=postgresql://user:pass@host/dbname?sslmode=require
+postgresql://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[region].pooler.supabase.com:5432/postgres
 ```
 
-Use the **Internal Database URL** from Render when the web service and Postgres are in the same region (faster). Append `?sslmode=require` if connecting via the external hostname.
+`sslmode=require` is added automatically for cloud hosts. **Never commit this URL to GitHub.**
 
-## 4. Required environment variables
+## 3. Required Render environment variables
 
-| Variable | Example | Notes |
-|----------|---------|-------|
-| `OPENAI_API_KEY` | `sk-...` | Required for AI features |
-| `AUTH_SECRET` | long random string | JWT signing (32+ chars) |
-| `REPORT_CODE` | random secret | Report download protection |
-| `AUTH_DB_URL` | from Render Postgres | Required for auth/data |
-| `CORS_ALLOW_ORIGINS` | `https://your-frontend.onrender.com` | Frontend URL(s), comma-separated |
-| `PUBLIC_BASE_URL` | `https://your-frontend.onrender.com` | Used in interview invite emails |
-| `UVICORN_WORKERS` | `1` | Keep at 1 until Redis session store |
+| Variable | Value |
+|----------|--------|
+| `AUTH_DB_URL` | Your Supabase connection URI |
+| `OPENAI_API_KEY` or per-purpose keys | Your OpenAI keys |
+| `AUTH_SECRET` | Long random string (32+ chars) |
+| `REPORT_CODE` | Random secret |
+| `CORS_ALLOW_ORIGINS` | `https://ai-interview-model-frontend-v2.vercel.app` |
+| `PUBLIC_BASE_URL` | `https://ai-interview-model-frontend-v2.vercel.app` |
+| `ALLOW_PUBLIC_HR_REGISTRATION` | `true` (until first HR user exists) |
+| `SMTP_ENABLED` | `false` |
+| `UVICORN_WORKERS` | `1` |
 
-SMTP is **disabled by default** (`SMTP_ENABLED=false`). Invite links appear in the HR dashboard; no email is sent unless you set `SMTP_ENABLED=true` and SMTP credentials.
-
-**Never commit `.env` to GitHub.**
-
-## 5. Verify deployment
+## 4. Verify
 
 ```bash
-curl https://YOUR-SERVICE.onrender.com/health/live
 curl https://YOUR-SERVICE.onrender.com/health/ready
 ```
 
-## 6. Connect frontend
+Expect `"database_connected": true` and `"database_backend": "postgresql"`.
 
-Point your frontend deployment at the Render API URL:
+## 5. Frontend (Vercel)
 
-- **Vite admin dev:** `VITE_BACKEND_URL=https://YOUR-SERVICE.onrender.com`
-- **Production static UI:** configure the frontend to call the Render API base URL and add that frontend origin to `CORS_ALLOW_ORIGINS`
-
-Local split-repo workflow is unchanged — see frontend `docs/BACKEND_CONNECTION.md`.
+API routes are proxied via `vercel.json` to your Render backend URL. No CORS changes needed in the browser when using the Vercel proxy.
 
 ## Notes
 
-- Render free tier spins down after inactivity; first request may be slow (~30s).
-- Container filesystem is ephemeral — use Postgres (`AUTH_DB_URL`), not local SQLite, in production.
-- HTTPS is terminated by Render; run uvicorn on HTTP internally (`PORT` env is set automatically).
+- Render free tier sleeps after inactivity (~30–60s cold start).
+- SMTP is off by default; invite emails are skipped until you set `SMTP_ENABLED=true` and SMTP credentials.
+- Use Supabase **Session pooler** (port 5432), not Transaction pooler, for this app.

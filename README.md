@@ -74,4 +74,4 @@ git remote set-url origin https://github.com/aadityapa/AI-Interview-Model-Backen
 git push -u origin main
 ```
 
-On Render: **New Web Service** → connect repo → **Docker** runtime → set env vars from `.env.example` → health check `/health/live`.
+On Render: **New Web Service** → Docker → set `AUTH_DB_URL` to your **Supabase** URI (no Render Postgres). See [docs/RENDER_DEPLOYMENT.md](docs/RENDER_DEPLOYMENT.md).
