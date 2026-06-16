@@ -12,7 +12,13 @@ from typing import Any
 logger = logging.getLogger("karnex.smtp")
 
 
+def smtp_enabled() -> bool:
+    return (os.getenv("SMTP_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"})
+
+
 def smtp_configured() -> bool:
+    if not smtp_enabled():
+        return False
     host = (os.getenv("SMTP_HOST") or "").strip()
     user = (os.getenv("SMTP_USER") or "").strip()
     pwd = (os.getenv("SMTP_PASSWORD") or "").strip()

@@ -47,7 +47,7 @@ Use the **Internal Database URL** from Render when the web service and Postgres 
 | `PUBLIC_BASE_URL` | `https://your-frontend.onrender.com` | Used in interview invite emails |
 | `UVICORN_WORKERS` | `1` | Keep at 1 until Redis session store |
 
-Optional SMTP vars for interview invite emails: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_TLS=true`
+SMTP is **disabled by default** (`SMTP_ENABLED=false`). Invite links appear in the HR dashboard; no email is sent unless you set `SMTP_ENABLED=true` and SMTP credentials.
 
 **Never commit `.env` to GitHub.**
 
