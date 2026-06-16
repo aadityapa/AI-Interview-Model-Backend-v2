@@ -27,7 +27,7 @@ from functools import lru_cache
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAIError
@@ -700,14 +700,26 @@ def _invite_host_port_from_request(request: Request) -> tuple[str | None, str]:
     return None, ""
 
 
+def _public_frontend_base_url() -> str:
+    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if pub and pub.lower() != "auto":
+        return pub
+    return ""
+
+
 def _invite_base_url(request: Request) -> str:
     """
     Invite URL precedence:
-    1) Browser Host / X-Forwarded-Host when it is a private LAN IPv4 (matches how HR opened the app).
-    2) PUBLIC_BASE_URL if set and not 'auto'.
+    1) PUBLIC_BASE_URL when set (production frontend — Vercel, etc.).
+    2) Browser Host / X-Forwarded-Host when it is a private LAN IPv4 (local HR dev).
     3) Auto-detect LAN IPv4 when request URL uses localhost/link-local.
-    4) Request base URL.
+    4) X-Forwarded-Host from reverse proxy when not the API host.
+    5) Request base URL.
     """
+    pub = _public_frontend_base_url()
+    if pub:
+        return pub
+
     req_url = str(request.base_url).rstrip("/")
     parsed = urlparse(req_url)
     scheme = parsed.scheme or "http"
@@ -717,10 +729,6 @@ def _invite_base_url(request: Request) -> str:
     if lan_ip:
         return f"{scheme}://{lan_ip}{port_hdr or port_fallback}"
 
-    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    if pub and pub.lower() != "auto":
-        return pub
-
     host = parsed.hostname or ""
     port = port_fallback
     bad_hosts = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0"}
@@ -728,6 +736,12 @@ def _invite_base_url(request: Request) -> str:
         detected = _detect_primary_lan_ip()
         if detected:
             return f"{scheme}://{detected}{port}"
+
+    fwd_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    if fwd_host and "onrender.com" not in fwd_host.lower():
+        fwd_proto = (request.headers.get("x-forwarded-proto") or scheme or "https").strip()
+        return f"{fwd_proto}://{fwd_host}"
+
     return req_url
 
 
@@ -7310,3 +7324,14 @@ if FRONTEND_DIR.exists():
             )
 
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+else:
+    pub_frontend = _public_frontend_base_url()
+
+    if pub_frontend:
+
+        @app.get("/", include_in_schema=False)
+        async def root_redirect_to_frontend(request: Request) -> RedirectResponse:
+            """API-only deploy: send browsers (invite links) to the Vercel frontend."""
+            qs = request.url.query
+            target = f"{pub_frontend}/" + (f"?{qs}" if qs else "")
+            return RedirectResponse(target, status_code=302)
