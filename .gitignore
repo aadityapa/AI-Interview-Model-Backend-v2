@@ -1,0 +1,16 @@
+backend/certs/*.pem
+.env
+.env.*
+!.env.example
+logs/server.log
+logs/*.log
+logs/*.recovered*.txt
+logs/openai-prompts/
+__pycache__/
+*.pyc
+node_modules/
+data/hr_records.json
+data/interview_learning.jsonl
+data/hr_access_code.txt
+data/proctor_reports.json
+data/*.db

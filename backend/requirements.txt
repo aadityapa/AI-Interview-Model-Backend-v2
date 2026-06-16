@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+openai
+pydantic
+pypdf
+openpyxl
+tzdata
+PyJWT
+psycopg2-binary
+cryptography>=42.0.0
+pytest>=8.0.0

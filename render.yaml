@@ -1,0 +1,51 @@
+# Render Blueprint — backend API only (split frontend repo).
+# Docs: docs/RENDER_DEPLOYMENT.md
+
+services:
+  - type: web
+    name: ai-interview-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health/live
+    envVars:
+      - key: UVICORN_WORKERS
+        value: "1"
+      - key: PROMPT_LOG_ENABLED
+        value: "true"
+      - key: PROMPT_LOG_FILE_ENABLED
+        value: "false"
+      - key: ALLOW_PUBLIC_HR_REGISTRATION
+        value: "false"
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: REPORT_CODE
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AUTH_DB_URL
+        fromDatabase:
+          name: karnex-db
+          property: connectionString
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
+
+databases:
+  - name: karnex-db
+    plan: free
+    databaseName: karnex_db
+    user: karnex_user
