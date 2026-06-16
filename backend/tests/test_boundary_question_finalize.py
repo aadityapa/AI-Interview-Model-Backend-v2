@@ -56,11 +56,12 @@ def test_boundary_metadata_on_timer_auto_save():
     )
     meta = session["meta"]
     assert meta["boundary_question_index"] == 1
-    assert meta["boundary_label"] == "Boundary Question Evaluated"
+    assert meta["boundary_label"] == "Auto-submitted on timeout"
+    assert meta["auto_submitted_on_timeout"] is True
     assert meta["boundary_auto_saved"] is True
 
     result = _attach_boundary_question_to_report(session, {"per_question": [{}, {}]})
     bq = result.get("boundary_question") or {}
-    assert bq.get("label") == "Boundary Question Evaluated"
+    assert bq.get("label") == "Auto-submitted on timeout"
     assert bq.get("report_turn") == 2
-    assert result["per_question"][1].get("boundary_label") == "Boundary Question Evaluated"
+    assert result["per_question"][1].get("boundary_label") == "Auto-submitted on timeout"

@@ -3935,54 +3935,6 @@ def hr_records(request: Request):
     return {"records": summary, "source": "records_file"}
 
 
-@app.get("/hr/database")
-def hr_database(request: Request, limit: int = 200):
-    _, auth_err = _require_user(request, {"hr"})
-    if auth_err:
-        return auth_err
-    return get_database_snapshot(AUTH_DB_TARGET, limit=limit)
-
-
-@app.get("/hr/diagnostics/answer-integrity")
-def hr_answer_integrity_diagnostics(
-    request: Request,
-    limit: int = 100,
-    since_minutes: int = 240,
-):
-    _, auth_err = _require_user(request, {"hr"})
-    if auth_err:
-        return auth_err
-
-    safe_limit = max(1, min(int(limit or 100), 500))
-    safe_since = max(1, min(int(since_minutes or 240), 60 * 24 * 14))
-    cutoff_ts = time.time() - (safe_since * 60)
-    with _ANSWER_AUDIT_LOCK:
-        entries = [e for e in list(_ANSWER_AUDIT) if float(e.get("ts") or 0) >= cutoff_ts]
-
-    total = len(entries)
-    send_saved = sum(1 for e in entries if e.get("status") == "saved" and e.get("action") == "send")
-    skip_saved = sum(1 for e in entries if e.get("status") == "saved" and e.get("action") == "skip")
-    empty_send_rejected = sum(1 for e in entries if e.get("status") == "rejected_empty_send")
-    suspicious_send_saved_as_skip = sum(
-        1 for e in entries
-        if e.get("status") == "saved" and e.get("action") == "send" and e.get("is_skipped_answer") is True
-    )
-
-    recent = sorted(entries, key=lambda e: float(e.get("ts") or 0), reverse=True)[:safe_limit]
-    return {
-        "window_minutes": safe_since,
-        "total_events": total,
-        "summary": {
-            "send_saved": send_saved,
-            "skip_saved": skip_saved,
-            "empty_send_rejected": empty_send_rejected,
-            "suspicious_send_saved_as_skip": suspicious_send_saved_as_skip,
-        },
-        "healthy": suspicious_send_saved_as_skip == 0,
-        "events": recent,
-    }
-
-
 def _safe_json_loads(text: str) -> dict | None:
     raw = (text or "").strip()
     if not raw:
@@ -4082,7 +4034,7 @@ def _dash_score_from_report(report: dict | None) -> int:
 
 _HR_DASHBOARD_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
 _HR_DASHBOARD_CACHE_LOCK = threading.Lock()
-_HR_DASHBOARD_TTL_S = float(os.getenv("HR_DASHBOARD_TTL_S", "30"))
+_HR_DASHBOARD_TTL_S = float(os.getenv("HR_DASHBOARD_TTL_S", "60"))
 
 
 def invalidate_hr_dashboard_cache() -> None:
@@ -4102,8 +4054,6 @@ def hr_dashboard(request: Request, limit: int = 500):
     if auth_err:
         return auth_err
     hr_user = str((user or {}).get("sub", "hr")).strip().lower() or "hr"
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
 
     bucket_limit = max(1, min(int(limit or 500), 1000))
     role_key = str((user or {}).get("role") or "hr").lower()
@@ -4113,6 +4063,9 @@ def hr_dashboard(request: Request, limit: int = 500):
             cached = _HR_DASHBOARD_CACHE.get(cache_key)
             if cached and (time.monotonic() - cached[0]) < _HR_DASHBOARD_TTL_S:
                 return cached[1]
+
+    _recover_interviews_once(limit=50)
+    _cleanup_expired_integrity_rows(hr_user)
 
     snap = get_database_snapshot(AUTH_DB_TARGET, limit=bucket_limit)
     rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
@@ -5161,39 +5114,6 @@ def hr_candidate_delete(request: Request, candidate_id: str):
     }
 
 
-@app.get("/network-info")
-def network_info(request: Request):
-    """Return LAN-friendly URLs for quick sharing."""
-    if _is_production_env():
-        _, auth_err = _require_user(request, {"hr", "admin", "manager"})
-        if auth_err:
-            return auth_err
-    ips: list[str] = []
-    try:
-        host = socket.gethostname()
-        for info in socket.getaddrinfo(host, None):
-            ip = info[4][0]
-            try:
-                addr = ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            if addr.version != 4:
-                continue
-            if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
-                continue
-            if ip not in ips:
-                ips.append(ip)
-    except Exception:
-        ips = []
-    base_urls = [f"http://{ip}:8010" for ip in ips]
-    return {
-        "port": 8010,
-        "local": "http://127.0.0.1:8010",
-        "lan": base_urls,
-        "admin": [f"{u}/admin" for u in base_urls],
-    }
-
-
 @app.get("/masters/opportunities")
 def master_opportunities(request: Request, q: str = "", limit: int = 20):
     _, auth_err = _require_user(request, {"hr"})
@@ -6127,27 +6047,6 @@ async def proctor_end_session(
                 extra={"event": "proctor.schedule_integrity_merge_failed", "invite": invite_tok[:12]},
             )
     return {"status": "ok", "session": sess}
-
-
-@app.get("/proctor/report/{candidate_id}")
-def proctor_report(request: Request, candidate_id: str):
-    _, auth_err = _require_user(request, {"hr"})
-    if auth_err:
-        return auth_err
-    reports = _load_proctor_reports()
-    rec = reports.get(str(candidate_id), None)
-    if not rec:
-        return {"error": "Report not found."}
-    viol = rec.get("violations", {})
-    score, status, prob, risk = _proctor_score(viol)
-    return {
-        "candidateId": candidate_id,
-        "violations": viol,
-        "proctorScore": score,
-        "status": status,
-        "anomaly": {"riskLevel": risk, "cheatingProbability": prob},
-        "session": rec,
-    }
 
 
 @app.get("/hr-record/{record_id}")
@@ -7204,14 +7103,14 @@ def interview_integrity_logs(request: Request):
         return auth_err
     payload = _decode_token_from_header(request)
     hr_user = str((payload or {}).get("sub", "hr")).strip().lower() or "hr"
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
     ttl = _integrity_logs_cache_ttl_s()
     if ttl > 0:
         with _INTEGRITY_LOGS_CACHE_LOCK:
             cached = _INTEGRITY_LOGS_CACHE.get(hr_user)
             if cached and (time.monotonic() - cached[0]) < ttl:
                 return cached[1]
+    _recover_interviews_once(limit=50)
+    _cleanup_expired_integrity_rows(hr_user)
     rows = list_interview_integrity_logs(AUTH_DB_TARGET, hr_user)
     rows = _dedupe_integrity_schedule_rows(rows)
     logs = []
