@@ -1,0 +1,6 @@
+Role,Skill,Difficulty,Category,Question,ExpectedAnswer,Keywords,IsActive
+Java Developer,Core Java,medium,technical,What is the difference between == and equals() in Java?,"== compares object references; equals() compares logical equality (overridable in classes like String).","equals,reference comparison,String",TRUE
+Java Developer,Spring Boot,medium,technical,What is dependency injection in Spring?,"DI is an IoC pattern where Spring creates and wires beans instead of the application using new; configured via @Autowired and constructors.","dependency injection,IoC,Spring",TRUE
+Java Developer,Collections,easy,technical,When would you use a HashMap versus a TreeMap?,"HashMap offers O(1) average lookup without ordering; TreeMap keeps keys sorted with O(log n) operations.","HashMap,TreeMap,collections",TRUE
+Java Developer,Multithreading,hard,technical,Explain the Java Memory Model happens-before relationship.,"Happens-before defines visibility guarantees between actions in different threads; synchronized, volatile, and thread start/join establish ordering.","JMM,happens-before,concurrency",TRUE
+Java Developer,JVM,medium,technical,What is garbage collection and name one collector in Java 11+?,"GC reclaims unreachable heap objects; G1 is the default collector on modern JDKs, balancing throughput and pause times.","GC,G1,heap",TRUE

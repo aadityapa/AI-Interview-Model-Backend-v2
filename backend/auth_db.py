@@ -810,7 +810,7 @@ def _normalized_manual_questions_for_job(value: Any) -> list[str]:
 
 def _coerce_question_type(raw: Any) -> str:
     s = str(raw or "dynamic").strip().lower()
-    return s if s in ("dynamic", "manual") else "dynamic"
+    return s if s in ("dynamic", "manual", "question_bank") else "dynamic"
 
 
 def _template_instructions_for_prompt(job: dict | None) -> str:
@@ -952,9 +952,7 @@ def upsert_job_template(db_target: DbTarget, job: dict) -> dict:
     payload["promptUpdatedAt"] = prompt_updated_at
     payload["promptHistory"] = prompt_history[:50]
 
-    qt = str(job.get("questionType") or job.get("question_type") or "dynamic").strip().lower()
-    if qt not in ("dynamic", "manual"):
-        qt = "dynamic"
+    qt = _coerce_question_type(job.get("questionType") or job.get("question_type"))
     mq = _normalized_manual_questions_for_job(
         job.get("manualQuestions") if job.get("manualQuestions") is not None else job.get("manual_questions")
     )
