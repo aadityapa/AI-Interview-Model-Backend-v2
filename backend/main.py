@@ -226,16 +226,27 @@ def _migrate_job_configs_to_db_if_needed() -> int:
 
 
 def load_env() -> None:
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """Load .env from project root. Prefer KARNEX_ENV_FILE, then E: .env when present."""
+    override = (os.getenv("KARNEX_ENV_FILE") or "").strip()
+    if override:
+        candidates = [Path(override)]
+    else:
+        candidates: list[Path] = []
+        alt = Path(r"E:\AI-Interview-Model-B-V2\.env")
+        if alt.is_file():
+            candidates.append(alt)
+        root = Path(__file__).resolve().parent.parent / ".env"
+        if root.is_file() and all(root.resolve() != p.resolve() for p in candidates):
+            candidates.append(root)
+    for env_path in candidates:
+        if not env_path.exists():
             continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
 
 
 load_env()
@@ -593,11 +604,18 @@ def _issue_access_token(user: dict, extra_claims: dict | None = None) -> tuple[s
     return token, exp_ist.isoformat()
 
 
-def _decode_token_from_header(request: Request) -> dict | None:
+def _auth_header_token(request: Request) -> str:
     auth = (request.headers.get("Authorization") or "").strip()
-    if not auth.startswith("Bearer "):
-        return None
-    token = auth[len("Bearer "):].strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    alt = (request.headers.get("X-Karnex-Authorization") or "").strip()
+    if alt.lower().startswith("bearer "):
+        return alt[7:].strip()
+    return alt
+
+
+def _decode_token_from_header(request: Request) -> dict | None:
+    token = _auth_header_token(request)
     if not token:
         return None
     try:
@@ -1048,6 +1066,55 @@ def _shuffle_manual_questions_for_session(questions: list[str], *seed_parts: str
     return out
 
 
+def _load_questions_from_question_bank(
+    job: dict | None,
+    weights: dict,
+    *,
+    pool_q: int,
+    seed: str,
+    avoid_history: list[str] | None = None,
+) -> tuple[list[str], dict[str, dict], list[dict]]:
+    """Select interview questions from the Question Bank using template weights."""
+    from services.question_bank.selection import bootstrap_question_bank_session
+
+    w = dict(weights or {})
+    cfg = w.get("questionBankConfig") if isinstance(w.get("questionBankConfig"), dict) else {}
+    if not cfg:
+        cfg = {}
+    if pool_q > 0:
+        cfg = {**cfg, "questionCount": pool_q}
+    w["questionBankConfig"] = cfg
+    if avoid_history:
+        from services.question_bank.selection import parse_question_bank_config
+
+        parsed = parse_question_bank_config(w)
+        if parsed.get("avoidDuplicateQuestions"):
+            merged_preview = list(w.get("previewQuestions") or [])
+            for q in avoid_history:
+                text = str(q or "").strip()
+                if text and text not in merged_preview:
+                    merged_preview.append(text)
+            w["previewQuestions"] = merged_preview
+    questions, snapshot, items = bootstrap_question_bank_session(
+        AUTH_DB_TARGET,
+        weights=w,
+        job=job,
+        num_q=pool_q,
+        seed=seed,
+    )
+    if not questions and avoid_history:
+        w2 = dict(w)
+        w2["previewQuestions"] = []
+        questions, snapshot, items = bootstrap_question_bank_session(
+            AUTH_DB_TARGET,
+            weights=w2,
+            job=job,
+            num_q=pool_q,
+            seed=seed,
+        )
+    return questions, snapshot, items
+
+
 _INVITE_BOOTSTRAP_LOCKS: dict[str, threading.Lock] = {}
 _INVITE_BOOTSTRAP_LOCKS_GUARD = threading.Lock()
 _INVITE_PREWARM_STATE: dict[str, dict] = {}
@@ -1417,6 +1484,8 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     qt_inv = _coerce_question_type((job or {}).get("questionType"))
     manual_list_inv = _normalized_manual_questions_for_job((job or {}).get("manualQuestions"))
     is_manual_invite = bool(job) and qt_inv == "manual"
+    is_qb_invite = bool(job) and qt_inv == "question_bank"
+    qb_snapshot_inv: dict[str, dict] = {}
 
     used_saved_preview = False
     if is_manual_invite:
@@ -1436,6 +1505,34 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             str((job or {}).get("jobId") or ""),
             str(schedule.get("scheduled_at_local") or ""),
         )
+        job_timing = str((job or {}).get("timingMode") or (job or {}).get("timing_mode") or timing_mode or "count").strip().lower()
+        if job_timing == "count":
+            ask_n = clamp_count_mode_questions(
+                invite_cfg.get("num_q") or (job or {}).get("numQ") or (job or {}).get("num_q") or num_q or 5
+            )
+            if len(questions) > ask_n:
+                questions = questions[:ask_n]
+        pool_q = len(questions)
+        num_q = len(questions)
+        used_saved_preview = True
+    elif is_qb_invite:
+        avoid_hist_qb = _build_question_avoid_history(job, weights)
+        qb_questions, qb_snapshot_inv, _qb_items = _load_questions_from_question_bank(
+            job,
+            weights,
+            pool_q=pool_q,
+            seed=question_seed,
+            avoid_history=avoid_hist_qb,
+        )
+        if not qb_questions:
+            return {
+                "error": (
+                    "No approved Question Bank items match this template "
+                    "(role, skills, difficulty, category). "
+                    "Open Question Bank to add questions or adjust template filters."
+                )
+            }
+        questions = list(qb_questions)
         job_timing = str((job or {}).get("timingMode") or (job or {}).get("timing_mode") or timing_mode or "count").strip().lower()
         if job_timing == "count":
             ask_n = clamp_count_mode_questions(
@@ -1567,9 +1664,14 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "num_q": num_q,
             "model": selected_model,
             "generation_mode": (
-                "manual" if is_manual_invite else ("ai" if has_ai and not safe_mode_on else "fallback")
+                "manual"
+                if is_manual_invite
+                else ("question_bank" if is_qb_invite else ("ai" if has_ai and not safe_mode_on else "fallback"))
             ),
-            "question_source": "manual" if is_manual_invite else "dynamic",
+            "question_source": (
+                "manual" if is_manual_invite else ("QUESTION_BANK" if is_qb_invite else "dynamic")
+            ),
+            "question_bank_snapshot": qb_snapshot_inv if is_qb_invite else {},
             "safe_mode": safe_mode_on,
             "candidate_profile": candidate_profile,
             "candidate_experience": invite_experience,
@@ -1594,7 +1696,9 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             if str(difficulty).strip().lower() in ("easy", "medium", "hard")
             else "medium",
             "followups_added": 0,
-            "max_followups": 0 if (is_manual_invite or not followup_mode_on) else max(0, pool_q - len(selected_skills)),
+            "max_followups": 0
+            if (is_manual_invite or is_qb_invite or not followup_mode_on)
+            else max(0, pool_q - len(selected_skills)),
             "job_id": str((job or {}).get("jobId") or ""),
             "job_title": job_title,
             "invite_token": invite_token,
@@ -2287,6 +2391,15 @@ except Exception as err:
     AUTH_DB_TARGET = KARNEX_DB_FILE
     init_auth_db(AUTH_DB_TARGET)
 try:
+    from services.question_bank.repository import ensure_question_bank_tables
+
+    ensure_question_bank_tables(AUTH_DB_TARGET)
+except Exception as err:
+    logger.warning(
+        "question_bank.table.init.failed",
+        extra={"event": "question_bank.table.init.failed", "error": str(err)},
+    )
+try:
     init_prompt_log_table(AUTH_DB_TARGET)
 except Exception as err:
     logger.warning("prompt_log.table.init.failed", extra={"event": "prompt_log.table.init.failed", "error": str(err)})
@@ -2613,6 +2726,8 @@ async def setup(
     qt_setup = _coerce_question_type((job_cfg_row or {}).get("questionType"))
     manual_list_setup = _normalized_manual_questions_for_job((job_cfg_row or {}).get("manualQuestions"))
     is_manual_interview = bool(job_id_setup and job_cfg_row and qt_setup == "manual")
+    is_qb_interview = bool(job_id_setup and job_cfg_row and qt_setup == "question_bank")
+    qb_snapshot_setup: dict[str, dict] = {}
 
     used_setup_saved_preview = False
     if is_manual_interview:
@@ -2632,6 +2747,35 @@ async def setup(
             str(candidate_name or "").strip().lower(),
         )
         setup_timing = str((job_cfg_row or {}).get("timingMode") or (job_cfg_row or {}).get("timing_mode") or timing_mode_val or "count").strip().lower()
+        if setup_timing == "count":
+            ask_n = clamp_count_mode_questions(num_q or (job_cfg_row or {}).get("numQ") or (job_cfg_row or {}).get("num_q") or 5)
+            if len(questions) > ask_n:
+                questions = questions[:ask_n]
+        pool_q = len(questions)
+        num_q = len(questions)
+        used_setup_saved_preview = True
+        warning = ""
+    elif is_qb_interview:
+        avoid_hist_qb = _build_question_avoid_history(job_cfg_row, weights_for_suite)
+        qb_questions, qb_snapshot_setup, _qb_items = _load_questions_from_question_bank(
+            job_cfg_row,
+            weights_for_suite,
+            pool_q=pool_q,
+            seed=question_seed,
+            avoid_history=avoid_hist_qb,
+        )
+        if not qb_questions:
+            return {
+                "error": (
+                    "No approved Question Bank items match this template "
+                    "(role, skills, difficulty, category). "
+                    "Edit the template filters or add questions in Question Bank."
+                )
+            }
+        questions = list(qb_questions)
+        setup_timing = str(
+            (job_cfg_row or {}).get("timingMode") or (job_cfg_row or {}).get("timing_mode") or timing_mode_val or "count"
+        ).strip().lower()
         if setup_timing == "count":
             ask_n = clamp_count_mode_questions(num_q or (job_cfg_row or {}).get("numQ") or (job_cfg_row or {}).get("num_q") or 5)
             if len(questions) > ask_n:
@@ -2775,8 +2919,15 @@ async def setup(
             "difficulty": difficulty,
             "num_q": num_q,
             "model": selected_model,
-            "generation_mode": ("manual" if is_manual_interview else ("ai" if not warning else "fallback")),
-            "question_source": "manual" if is_manual_interview else "dynamic",
+            "generation_mode": (
+                "manual"
+                if is_manual_interview
+                else ("question_bank" if is_qb_interview else ("ai" if not warning else "fallback"))
+            ),
+            "question_source": (
+                "manual" if is_manual_interview else ("QUESTION_BANK" if is_qb_interview else "dynamic")
+            ),
+            "question_bank_snapshot": qb_snapshot_setup if is_qb_interview else {},
             "safe_mode": safe_mode_on,
             "candidate_profile": candidate_profile,
             "candidate_experience": candidate_experience,
@@ -2802,7 +2953,7 @@ async def setup(
             else "medium",
             "followups_added": 0,
             "max_followups": 0
-            if (is_manual_interview or not followup_mode_on)
+            if (is_manual_interview or is_qb_interview or not followup_mode_on)
             else max(0, pool_q - len(selected_skills)),
             "job_id": job_id_setup,
             "job_title": job_title_for_session,
@@ -2825,7 +2976,7 @@ async def setup(
     record_generated_questions_batch(
         sessions[setup_session_key],
         questions,
-        source="manual" if is_manual_interview else "dynamic",
+        source="manual" if is_manual_interview else ("QUESTION_BANK" if is_qb_interview else "dynamic"),
     )
     _persist_interview_progress(sessions[setup_session_key], status="started")
     logger.info(
@@ -3935,6 +4086,54 @@ def hr_records(request: Request):
     return {"records": summary, "source": "records_file"}
 
 
+@app.get("/hr/database")
+def hr_database(request: Request, limit: int = 200):
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    return get_database_snapshot(AUTH_DB_TARGET, limit=limit)
+
+
+@app.get("/hr/diagnostics/answer-integrity")
+def hr_answer_integrity_diagnostics(
+    request: Request,
+    limit: int = 100,
+    since_minutes: int = 240,
+):
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+
+    safe_limit = max(1, min(int(limit or 100), 500))
+    safe_since = max(1, min(int(since_minutes or 240), 60 * 24 * 14))
+    cutoff_ts = time.time() - (safe_since * 60)
+    with _ANSWER_AUDIT_LOCK:
+        entries = [e for e in list(_ANSWER_AUDIT) if float(e.get("ts") or 0) >= cutoff_ts]
+
+    total = len(entries)
+    send_saved = sum(1 for e in entries if e.get("status") == "saved" and e.get("action") == "send")
+    skip_saved = sum(1 for e in entries if e.get("status") == "saved" and e.get("action") == "skip")
+    empty_send_rejected = sum(1 for e in entries if e.get("status") == "rejected_empty_send")
+    suspicious_send_saved_as_skip = sum(
+        1 for e in entries
+        if e.get("status") == "saved" and e.get("action") == "send" and e.get("is_skipped_answer") is True
+    )
+
+    recent = sorted(entries, key=lambda e: float(e.get("ts") or 0), reverse=True)[:safe_limit]
+    return {
+        "window_minutes": safe_since,
+        "total_events": total,
+        "summary": {
+            "send_saved": send_saved,
+            "skip_saved": skip_saved,
+            "empty_send_rejected": empty_send_rejected,
+            "suspicious_send_saved_as_skip": suspicious_send_saved_as_skip,
+        },
+        "healthy": suspicious_send_saved_as_skip == 0,
+        "events": recent,
+    }
+
+
 def _safe_json_loads(text: str) -> dict | None:
     raw = (text or "").strip()
     if not raw:
@@ -4034,7 +4233,7 @@ def _dash_score_from_report(report: dict | None) -> int:
 
 _HR_DASHBOARD_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
 _HR_DASHBOARD_CACHE_LOCK = threading.Lock()
-_HR_DASHBOARD_TTL_S = float(os.getenv("HR_DASHBOARD_TTL_S", "60"))
+_HR_DASHBOARD_TTL_S = float(os.getenv("HR_DASHBOARD_TTL_S", "30"))
 
 
 def invalidate_hr_dashboard_cache() -> None:
@@ -4054,6 +4253,8 @@ def hr_dashboard(request: Request, limit: int = 500):
     if auth_err:
         return auth_err
     hr_user = str((user or {}).get("sub", "hr")).strip().lower() or "hr"
+    _recover_interviews_once(limit=50)
+    _cleanup_expired_integrity_rows(hr_user)
 
     bucket_limit = max(1, min(int(limit or 500), 1000))
     role_key = str((user or {}).get("role") or "hr").lower()
@@ -4063,9 +4264,6 @@ def hr_dashboard(request: Request, limit: int = 500):
             cached = _HR_DASHBOARD_CACHE.get(cache_key)
             if cached and (time.monotonic() - cached[0]) < _HR_DASHBOARD_TTL_S:
                 return cached[1]
-
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
 
     snap = get_database_snapshot(AUTH_DB_TARGET, limit=bucket_limit)
     rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
@@ -5114,6 +5312,39 @@ def hr_candidate_delete(request: Request, candidate_id: str):
     }
 
 
+@app.get("/network-info")
+def network_info(request: Request):
+    """Return LAN-friendly URLs for quick sharing."""
+    if _is_production_env():
+        _, auth_err = _require_user(request, {"hr", "admin", "manager"})
+        if auth_err:
+            return auth_err
+    ips: list[str] = []
+    try:
+        host = socket.gethostname()
+        for info in socket.getaddrinfo(host, None):
+            ip = info[4][0]
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if addr.version != 4:
+                continue
+            if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+                continue
+            if ip not in ips:
+                ips.append(ip)
+    except Exception:
+        ips = []
+    base_urls = [f"http://{ip}:8010" for ip in ips]
+    return {
+        "port": 8010,
+        "local": "http://127.0.0.1:8010",
+        "lan": base_urls,
+        "admin": [f"{u}/admin" for u in base_urls],
+    }
+
+
 @app.get("/masters/opportunities")
 def master_opportunities(request: Request, q: str = "", limit: int = 20):
     _, auth_err = _require_user(request, {"hr"})
@@ -5480,6 +5711,133 @@ async def template_sample_questions(
         "effectivePrompt": template_prompt,
         "charCount": len(template_prompt),
         "tokenEstimate": estimate_tokens(template_prompt),
+    }
+
+
+@app.post("/job/template/question-bank-preview")
+@app.post("/api/template/question-bank-preview")
+@_rl.limit("30/minute")
+async def template_question_bank_preview(
+    request: Request,
+    role: str = Form(""),
+    requiredSkills: str = Form(""),
+    optionalSkills: str = Form(""),
+    difficulty: str = Form(""),
+    difficulties: str = Form(""),
+    category: str = Form(""),
+    categories: str = Form(""),
+    questionCount: int = Form(10),
+    randomizationEnabled: str = Form("true"),
+    avoidDuplicateQuestions: str = Form("true"),
+    excludedQuestionIds: str = Form(""),
+):
+    """Preview Question Bank matches for template configuration (HR)."""
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    from services.question_bank.repository import count_questions_for_interview, select_questions_for_interview
+
+    required_list = [s.strip() for s in str(requiredSkills or "").split(",") if s.strip()]
+    optional_list = [s.strip() for s in str(optionalSkills or "").split(",") if s.strip()]
+    seen: set[str] = set()
+    skills: list[str] = []
+    for sk in required_list + optional_list:
+        key = sk.lower()
+        if key not in seen:
+            seen.add(key)
+            skills.append(sk)
+    role_line = str(role or "").strip()
+    if not role_line:
+        return JSONResponse({"error": "Target role is required for Question Bank mode."}, status_code=400)
+    if not skills:
+        return JSONResponse({"error": "At least one required skill is needed."}, status_code=400)
+
+    def _parse_csv_filter(raw: str, fallback: str, allowed: set[str]) -> list[str]:
+        parts = [s.strip().lower() for s in str(raw or "").split(",") if s.strip()]
+        if not parts and fallback:
+            parts = [str(fallback).strip().lower()]
+        return [p for p in parts if p in allowed]
+
+    diff_list = _parse_csv_filter(difficulties, difficulty or "medium", {"easy", "medium", "hard"})
+    cat_list = _parse_csv_filter(categories, category or "technical", {"technical", "behavioral", "situational", "general"})
+    excluded = [s.strip() for s in str(excludedQuestionIds or "").split(",") if s.strip()]
+    count = max(1, min(int(questionCount or 10), MAX_COUNT_MODE_QUESTIONS))
+    randomize = str(randomizationEnabled or "true").strip().lower() in {"1", "true", "yes", "on"}
+
+    faux_weights = {
+        "intelligenceTargetRole": role_line,
+        "questionBankConfig": {
+            "role": role_line,
+            "skills": skills,
+            "difficulties": diff_list,
+            "categories": cat_list,
+            "difficulty": diff_list[0] if diff_list else "medium",
+            "category": cat_list[0] if cat_list else "technical",
+            "questionCount": count,
+            "randomizationEnabled": randomize,
+            "avoidDuplicateQuestions": str(avoidDuplicateQuestions or "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            "excludedQuestionIds": excluded,
+        },
+    }
+    items = select_questions_for_interview(
+        AUTH_DB_TARGET,
+        role=role_line,
+        skills=skills,
+        difficulty=diff_list,
+        category=cat_list,
+        count=count,
+        randomize=randomize,
+        excluded_ids=excluded,
+        seed="template-preview",
+    )
+    pool_total = count_questions_for_interview(
+        AUTH_DB_TARGET,
+        role=role_line,
+        skills=skills,
+        difficulty=diff_list,
+        category=cat_list,
+        excluded_ids=excluded,
+    )
+    if not items:
+        diff_label = ", ".join(diff_list) or "any"
+        cat_label = ", ".join(cat_list) or "any"
+        return JSONResponse(
+            {
+                "error": (
+                    "No active, approved questions found for the selected role, skills, "
+                    f"difficulty ({diff_label}), and category ({cat_label}). "
+                    "Add questions in Question Bank or adjust filters."
+                ),
+                "matches": [],
+                "questions": [],
+                "totalMatched": 0,
+                "poolTotal": pool_total,
+            },
+            status_code=404,
+        )
+    questions = [str(it.get("question") or "").strip() for it in items if str(it.get("question") or "").strip()]
+    matches = [
+        {
+            "id": it.get("id"),
+            "role": it.get("role") or "",
+            "skill": it.get("skill") or "",
+            "difficulty": it.get("difficulty") or "",
+            "category": it.get("category") or "",
+            "question": it.get("question") or "",
+        }
+        for it in items
+    ]
+    return {
+        "questions": questions,
+        "matches": matches,
+        "totalMatched": len(questions),
+        "poolTotal": pool_total,
+        "skillsUsed": skills,
+        "role": role_line,
+        "difficulties": diff_list,
+        "categories": cat_list,
+        "questionBankConfig": faux_weights["questionBankConfig"],
     }
 
 
@@ -6049,6 +6407,27 @@ async def proctor_end_session(
     return {"status": "ok", "session": sess}
 
 
+@app.get("/proctor/report/{candidate_id}")
+def proctor_report(request: Request, candidate_id: str):
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    reports = _load_proctor_reports()
+    rec = reports.get(str(candidate_id), None)
+    if not rec:
+        return {"error": "Report not found."}
+    viol = rec.get("violations", {})
+    score, status, prob, risk = _proctor_score(viol)
+    return {
+        "candidateId": candidate_id,
+        "violations": viol,
+        "proctorScore": score,
+        "status": status,
+        "anomaly": {"riskLevel": risk, "cheatingProbability": prob},
+        "session": rec,
+    }
+
+
 @app.get("/hr-record/{record_id}")
 def hr_record(request: Request, record_id: str):
     _, auth_err = _require_user(request, {"hr"})
@@ -6389,6 +6768,8 @@ def auth_me(request: Request):
     payload, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
         return auth_err
+    from routers.question_bank import is_super_admin
+
     return {
         "status": "ok",
         "user": {
@@ -6396,6 +6777,7 @@ def auth_me(request: Request):
             "role": payload.get("role", ""),
             "full_name": payload.get("full_name", ""),
             "email": payload.get("email", ""),
+            "is_super_admin": is_super_admin(payload or {}),
         },
     }
 
@@ -7103,14 +7485,14 @@ def interview_integrity_logs(request: Request):
         return auth_err
     payload = _decode_token_from_header(request)
     hr_user = str((payload or {}).get("sub", "hr")).strip().lower() or "hr"
+    _recover_interviews_once(limit=50)
+    _cleanup_expired_integrity_rows(hr_user)
     ttl = _integrity_logs_cache_ttl_s()
     if ttl > 0:
         with _INTEGRITY_LOGS_CACHE_LOCK:
             cached = _INTEGRITY_LOGS_CACHE.get(hr_user)
             if cached and (time.monotonic() - cached[0]) < ttl:
                 return cached[1]
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
     rows = list_interview_integrity_logs(AUTH_DB_TARGET, hr_user)
     rows = _dedupe_integrity_schedule_rows(rows)
     logs = []
@@ -7182,9 +7564,12 @@ def interview_integrity_logs(request: Request):
 # ---------------------------------------------------------------------------
 
 from routers import admin as admin_router
+from routers import question_bank as question_bank_router
 
 admin_router.configure(AUTH_DB_TARGET, _require_user)
 app.include_router(admin_router.router)
+question_bank_router.configure(AUTH_DB_TARGET, _require_user)
+app.include_router(question_bank_router.router)
 
 # Optional slowapi-based rate limiting. No-op unless RATE_LIMIT_ENABLED=true.
 _rl.setup_rate_limit(app)
