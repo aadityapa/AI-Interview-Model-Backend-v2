@@ -4,7 +4,7 @@ Repo: [AI-Interview-Model-Backend-v2](https://github.com/aadityapa/AI-Interview-
 
 - **Backend:** Render Web Service (Docker)
 - **Database:** [Supabase](https://supabase.com) PostgreSQL (not Render Postgres)
-- **Frontend:** Vercel — `https://ai-interview-model-frontend-v2.vercel.app`
+- **Frontend:** Vercel — `https://interview.karnex.in` (custom domain; Vercel default URL still works for API proxy)
 
 ## 1. Render Web Service
 
@@ -33,8 +33,8 @@ postgresql://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[region].pooler.supabase.co
 | `OPENAI_API_KEY` or per-purpose keys | Your OpenAI keys |
 | `AUTH_SECRET` | Long random string (32+ chars) |
 | `REPORT_CODE` | Random secret |
-| `CORS_ALLOW_ORIGINS` | `https://ai-interview-model-frontend-v2.vercel.app` |
-| `PUBLIC_BASE_URL` | `https://ai-interview-model-frontend-v2.vercel.app` |
+| `CORS_ALLOW_ORIGINS` | `https://interview.karnex.in` (add `,https://ai-interview-model-frontend-v2.vercel.app` if you still use the Vercel URL) |
+| `PUBLIC_BASE_URL` | `https://interview.karnex.in` |
 | `ALLOW_PUBLIC_HR_REGISTRATION` | `true` (until first HR user exists) |
 | `SMTP_ENABLED` | `false` |
 | `UVICORN_WORKERS` | `1` |
