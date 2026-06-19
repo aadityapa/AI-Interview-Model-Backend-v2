@@ -1380,6 +1380,35 @@ def _evaluate_per_question_chunk_openai_indexed(
         return []
 
 
+def _apply_question_bank_expected_answers(
+    rows: List[dict],
+    questions: List[str],
+    session_meta: dict | None,
+) -> None:
+    """Attach bank-authored expected answers to report rows when available."""
+    snap = (session_meta or {}).get("question_bank_snapshot")
+    if not isinstance(snap, dict) or not snap:
+        return
+    by_question: dict[str, str] = {}
+    for entry in snap.values():
+        if not isinstance(entry, dict):
+            continue
+        q = str(entry.get("question") or "").strip()
+        expected = str(entry.get("expected_answer") or "").strip()
+        if q and expected:
+            by_question[q] = expected
+    if not by_question:
+        return
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        q = str((questions[i] if i < len(questions) else "") or "").strip()
+        expected = by_question.get(q)
+        if expected:
+            row["expected_answer"] = expected
+            row["ideal_answer"] = expected
+
+
 def merge_per_question_eval_into_report(
     result: dict,
     questions: List[str],
@@ -1443,6 +1472,7 @@ def merge_per_question_eval_into_report(
 
     out["per_question"] = rows
     out["question_evaluations"] = rows
+    _apply_question_bank_expected_answers(rows, qs_aligned, session_meta)
     out["attempted_questions_only"] = True
     excluded_hr = sum(1 for i in range(n) if is_row_excluded_from_score(rows[i] if i < len(rows) else None))
     out["scoring_summary"] = {

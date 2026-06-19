@@ -457,6 +457,18 @@ def _select_columns() -> str:
     )
 
 
+def _question_column_expr(db_target: str | Path) -> str:
+    """Legacy tables may use question_text instead of question."""
+    cols = _question_bank_column_names(str(db_target))
+    if "question" in cols and "question_text" in cols:
+        return "COALESCE(NULLIF(question, ''), question_text)"
+    if "question" in cols:
+        return "question"
+    if "question_text" in cols:
+        return "question_text"
+    return "question"
+
+
 def get_dashboard_stats(db_target: str | Path) -> dict:
     pg = _is_postgres(db_target)
     with _connect(db_target) as conn:
@@ -1175,13 +1187,14 @@ def select_questions_for_interview(
         excluded_ids=excluded_ids,
     )
     where = " WHERE " + " AND ".join(clauses)
+    qcol = _question_column_expr(db_target)
     with _connect(db_target) as conn:
         if _is_postgres(db_target):
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT id, role, skill, difficulty, category,
-                           COALESCE(NULLIF(question, ''), question_text) AS question,
+                           {qcol} AS question,
                            expected_answer, keywords, question_hash
                     FROM question_bank{where}
                     """,
@@ -1211,7 +1224,7 @@ def select_questions_for_interview(
             cur.execute(
                 f"""
                 SELECT id, role, skill, difficulty, category,
-                       COALESCE(NULLIF(question, ''), question_text) AS question,
+                       {qcol} AS question,
                        expected_answer, keywords, question_hash
                 FROM question_bank{where}
                 """,

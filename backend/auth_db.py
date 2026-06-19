@@ -952,7 +952,7 @@ def upsert_job_template(db_target: DbTarget, job: dict) -> dict:
     payload["promptUpdatedAt"] = prompt_updated_at
     payload["promptHistory"] = prompt_history[:50]
 
-    qt = _coerce_question_type(job.get("questionType") or job.get("question_type"))
+    qt = _coerce_question_type(job.get("questionType") or job.get("question_type") or "dynamic")
     mq = _normalized_manual_questions_for_job(
         job.get("manualQuestions") if job.get("manualQuestions") is not None else job.get("manual_questions")
     )

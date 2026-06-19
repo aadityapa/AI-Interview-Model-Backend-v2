@@ -71,6 +71,7 @@ def bootstrap_question_bank_session(
     job: dict | None,
     num_q: int,
     seed: str,
+    avoid_question_texts: list[str] | None = None,
 ) -> tuple[list[str], dict[str, dict], list[dict]]:
     """
     Select questions from bank and build session artifacts.
@@ -106,16 +107,16 @@ def bootstrap_question_bank_session(
 
     count = max(1, min(cfg["questionCount"] or num_q or 10, num_q or 10))
     avoid_hashes: set[str] | None = None
-    if cfg["avoidDuplicateQuestions"]:
+    if cfg["avoidDuplicateQuestions"] and avoid_question_texts:
         from services.question_bank.hash_utils import question_hash
 
-        avoid_hashes = set()
-        preview = weights.get("previewQuestions") if isinstance(weights, dict) else None
-        if isinstance(preview, list):
-            for q in preview:
-                text = str(q or "").strip()
-                if text:
-                    avoid_hashes.add(question_hash(text))
+        avoid_hashes = {
+            question_hash(text)
+            for text in avoid_question_texts
+            if str(text or "").strip()
+        }
+        if not avoid_hashes:
+            avoid_hashes = None
 
     items = select_questions_for_interview(
         db_target,
