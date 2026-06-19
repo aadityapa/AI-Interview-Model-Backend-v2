@@ -4,7 +4,7 @@ Repo: [AI-Interview-Model-Backend-v2](https://github.com/aadityapa/AI-Interview-
 
 - **Backend:** Render Web Service (Docker)
 - **Database:** [Supabase](https://supabase.com) PostgreSQL (not Render Postgres)
-- **Frontend:** Vercel — `https://interview.karnex.in` (custom domain; Vercel default URL still works for API proxy)
+- **Frontend:** Vercel — production at `https://interview.karnex.in` (preview: `https://ai-interview-model-frontend-v2.vercel.app`)
 
 ## 1. Render Web Service
 
@@ -33,7 +33,7 @@ postgresql://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[region].pooler.supabase.co
 | `OPENAI_API_KEY` or per-purpose keys | Your OpenAI keys |
 | `AUTH_SECRET` | Long random string (32+ chars) |
 | `REPORT_CODE` | Random secret |
-| `CORS_ALLOW_ORIGINS` | `https://interview.karnex.in` (add `,https://ai-interview-model-frontend-v2.vercel.app` if you still use the Vercel URL) |
+| `CORS_ALLOW_ORIGINS` | `https://interview.karnex.in,https://ai-interview-model-frontend-v2.vercel.app` |
 | `PUBLIC_BASE_URL` | `https://interview.karnex.in` |
 | `ALLOW_PUBLIC_HR_REGISTRATION` | `true` (until first HR user exists) |
 | `SMTP_ENABLED` | `false` |
@@ -49,7 +49,9 @@ Expect `"database_connected": true` and `"database_backend": "postgresql"`.
 
 ## 5. Frontend (Vercel)
 
-API routes are proxied via `vercel.json` to your Render backend URL. No CORS changes needed in the browser when using the Vercel proxy.
+Production domain: **https://interview.karnex.in** (add in Vercel → Project → Settings → Domains).
+
+API routes are proxied via `vercel.json` to your Render backend URL. Invite links use `PUBLIC_BASE_URL` on Render — must match this domain.
 
 ## Notes
 
