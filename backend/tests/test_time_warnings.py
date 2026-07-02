@@ -10,6 +10,7 @@ from utils.time_warnings import (
 def test_defaults_enabled():
     cfg = resolve_time_warning_settings({})
     assert cfg["enabled"] is True
+    assert cfg["tts_announcements"] is False
     assert cfg["thresholds_sec"]["5min"] == 300
     assert cfg["thresholds_sec"]["30sec"] == 30
 

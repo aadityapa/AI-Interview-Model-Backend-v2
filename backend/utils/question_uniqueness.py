@@ -270,6 +270,13 @@ def ensure_unique_served_question(session: dict) -> bool:
     Returns True when the current question was replaced.
     """
     meta = session.get("meta", {}) or {}
+    try:
+        from utils.invite_session_guard import is_locked_question_source
+
+        if is_locked_question_source(meta):
+            return False
+    except Exception:
+        pass
     prior = session_prior_questions(session, include_future=False)
     if not prior:
         return False

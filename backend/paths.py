@@ -2,10 +2,20 @@ from pathlib import Path
 import os
 import shutil
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+# Keep the drive letter the developer uses (e.g. E:\). Do not .resolve() here —
+# Windows junctions can map E:\AI-Interview-Model-B-V2 to D:\ and load the wrong tree.
+ROOT_DIR = Path(__file__).parent.parent
 DATA_DIR = ROOT_DIR / "data"
 LOGS_DIR = ROOT_DIR / "logs"
 DOCS_DIR = ROOT_DIR / "docs"
+
+
+def _normalize_path(path: Path) -> Path:
+    """Expand ~ and make relative paths absolute without following junction reparse points."""
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return (Path.cwd() / expanded)
 
 
 def _resolve_frontend_dir() -> Path:
@@ -19,13 +29,13 @@ def _resolve_frontend_dir() -> Path:
     """
     raw = (os.getenv("FRONTEND_DIR") or "").strip()
     if raw:
-        return Path(raw).expanduser().resolve()
+        return _normalize_path(Path(raw))
 
     local = ROOT_DIR / "frontend"
     if local.is_dir():
         return local
 
-    sibling = (ROOT_DIR.parent / "AI-Interview-Model-F-V2" / "frontend").resolve()
+    sibling = ROOT_DIR.parent / "AI-Interview-Model-F-V2" / "frontend"
     if sibling.is_dir():
         return sibling
 

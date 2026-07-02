@@ -70,13 +70,19 @@ def upsert_hr_record_async(data_file: Path, record: dict) -> None:
     threading.Thread(target=_write, daemon=True, name="hr-records-json").start()
 
 
+def interview_record_key(record: dict) -> str:
+    """Primary dashboard/report key — one row per interview, never email alone."""
+    rid = str(record.get("id") or "").strip()
+    if rid:
+        return rid
+    invite = str(record.get("invite_token") or "").strip()
+    if invite:
+        return f"invite:{invite}"
+    return ""
+
+
 def _candidate_id_for_record(record: dict) -> str:
-    profile = record.get("candidate_profile") or {}
-    email = (str(record.get("candidate_email") or profile.get("email") or "")).strip().lower()
-    if email and email != "not available":
-        return email
-    name = (str(record.get("candidate_name") or profile.get("name") or "")).strip().lower()
-    return name
+    return interview_record_key(record) or "unknown"
 
 
 def list_records_for_candidate(data_file: Path, candidate_id: str) -> list[dict]:

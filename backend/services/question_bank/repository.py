@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,15 @@ from services.question_bank.hash_utils import question_hash
 VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard"})
 VALID_CATEGORIES = frozenset({"technical", "behavioral", "situational", "general"})
 VALID_APPROVAL_STATUSES = frozenset({"approved", "pending", "rejected"})
+
+
+def qb_require_approval() -> bool:
+    return str(os.getenv("QB_REQUIRE_APPROVAL") or "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _append_approved_only_filter(clauses: list[str], *, for_interview: bool) -> None:
+    if for_interview and qb_require_approval():
+        clauses.append("approval_status = 'approved'")
 
 CSV_COLUMNS = (
     "Role",
@@ -332,6 +342,7 @@ def ensure_question_bank_tables(db_target: str | Path) -> None:
             )
             conn.commit()
     _patch_question_bank_schema(db_target)
+    _ensure_question_bank_versions_table(db_target)
     with _connect(db_target) as conn:
         index_sql = (
             "CREATE INDEX IF NOT EXISTS idx_qb_role ON question_bank (role)",
@@ -446,6 +457,49 @@ def _patch_question_bank_schema(db_target: str | Path) -> None:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_qb_role ON question_bank (role)")
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_qb_approval_status ON question_bank (approval_status)"
+            )
+            conn.commit()
+
+
+def _ensure_question_bank_versions_table(db_target: str | Path) -> None:
+    pg = _is_postgres(db_target)
+    with _connect(db_target) as conn:
+        if pg:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS question_bank_versions (
+                        id TEXT PRIMARY KEY,
+                        question_id TEXT NOT NULL,
+                        version INTEGER NOT NULL DEFAULT 1,
+                        question TEXT NOT NULL DEFAULT '',
+                        expected_answer TEXT NOT NULL DEFAULT '',
+                        approval_status TEXT NOT NULL DEFAULT 'approved',
+                        changed_by TEXT NOT NULL DEFAULT '',
+                        change_note TEXT NOT NULL DEFAULT '',
+                        changed_at TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_qbv_question ON question_bank_versions (question_id, version DESC)"
+                )
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS question_bank_versions (
+                    id TEXT PRIMARY KEY,
+                    question_id TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    question TEXT NOT NULL DEFAULT '',
+                    expected_answer TEXT NOT NULL DEFAULT '',
+                    approval_status TEXT NOT NULL DEFAULT 'approved',
+                    changed_by TEXT NOT NULL DEFAULT '',
+                    change_note TEXT NOT NULL DEFAULT '',
+                    changed_at TEXT NOT NULL DEFAULT ''
+                )
+                """
             )
             conn.commit()
 
@@ -760,7 +814,9 @@ def create_question(db_target: str | Path, data: dict, *, created_by: str = "") 
     category = str(data.get("category") or "technical").strip().lower()
     if category not in VALID_CATEGORIES:
         raise ValueError("Invalid category")
-    approval = str(data.get("approvalStatus") or data.get("approval_status") or "approved").strip().lower()
+    approval = str(data.get("approvalStatus") or data.get("approval_status") or "").strip().lower()
+    if not approval:
+        approval = "pending" if qb_require_approval() else "approved"
     if approval not in VALID_APPROVAL_STATUSES:
         raise ValueError("Invalid approval status")
     qhash = question_hash(qtext)
@@ -805,6 +861,7 @@ def update_question(db_target: str | Path, question_id: str, data: dict, *, upda
     existing = get_question(db_target, question_id)
     if not existing:
         raise ValueError("Question not found")
+    _save_question_version_snapshot(db_target, existing, actor=actor, note="pre_update")
     qtext = str(data.get("question") or existing["question"]).strip()
     expected = str(data.get("expectedAnswer") or data.get("expected_answer") or existing["expectedAnswer"]).strip()
     if not qtext:
@@ -820,6 +877,12 @@ def update_question(db_target: str | Path, question_id: str, data: dict, *, upda
     approval = str(
         data.get("approvalStatus") or data.get("approval_status") or existing["approvalStatus"]
     ).strip().lower()
+    material_change = (
+        qtext != str(existing.get("question") or "").strip()
+        or expected != str(existing.get("expectedAnswer") or "").strip()
+    )
+    if material_change and qb_require_approval() and approval == str(existing.get("approvalStatus") or "approved").lower():
+        approval = "pending"
     if approval not in VALID_APPROVAL_STATUSES:
         raise ValueError("Invalid approval status")
     qhash = question_hash(qtext)
@@ -944,11 +1007,24 @@ def list_skills(db_target: str | Path, *, role: str = "") -> list[str]:
 
 
 def export_questions_csv(db_target: str | Path) -> str:
-    result = list_questions(db_target, page=1, page_size=10000)
+    """Export all question_bank rows (bypasses list_questions 100-row page cap)."""
+    cols = _select_columns()
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(CSV_COLUMNS)
-    for item in result.get("items") or []:
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {cols} FROM question_bank ORDER BY created_at DESC",
+                )
+                rows = cur.fetchall() or []
+        else:
+            cur = conn.cursor()
+            cur.execute(f"SELECT {cols} FROM question_bank ORDER BY created_at DESC")
+            rows = cur.fetchall() or []
+    for raw in rows:
+        item = _question_api(_row_to_dict(raw))
         writer.writerow(
             [
                 item.get("role"),
@@ -1024,7 +1100,12 @@ def _append_role_filter(
     role: str,
     skills: list[str] | None = None,
 ) -> None:
-    """Match exact role, blank bank role, partial overlap, or bank role equals a requested skill."""
+    """Match blank bank role, template role overlap, or bank row tagged with a requested skill.
+
+    Bank rows often use a generic role (e.g. "Java Developer") with a specific skill column
+    (e.g. "Spring Boot"). When HR lists multiple required skills, those rows must not be
+    rejected because the role column differs from the template title.
+    """
     r = str(role or "").strip()
     norm_skills = [s.strip() for s in (skills or []) if str(s).strip()]
     if not r and not norm_skills:
@@ -1041,8 +1122,10 @@ def _append_role_filter(
         )
         params.extend([r, r, r])
     for sk in norm_skills:
+        # Match when role OR skill column equals the requested skill label.
         parts.append(f"LOWER(role) = LOWER({ph})")
-        params.append(sk)
+        parts.append(f"LOWER(skill) = LOWER({ph})")
+        params.extend([sk, sk])
     clauses.append("(" + " OR ".join(parts) + ")")
 
 
@@ -1063,6 +1146,13 @@ def _append_skills_filter(clauses: list[str], params: list[Any], db_target: str 
         )
         params.extend([sk, f"%{sk}%", f"%{sk}%"])
     clauses.append("(" + " OR ".join(groups) + ")")
+
+
+def _should_apply_role_filter(role: str, skills: list[str]) -> bool:
+    """When HR lists required skills, match on skill column only — not bank role labels."""
+    if [s.strip() for s in (skills or []) if str(s).strip()]:
+        return False
+    return bool(str(role or "").strip())
 
 
 def _normalize_filter_values(value: str | list[str] | None, *, allowed: set[str] | None = None) -> list[str]:
@@ -1126,6 +1216,153 @@ def _append_interview_filters(
     _append_excluded_ids_filter(clauses, params, db_target, excluded_ids)
 
 
+def _row_matches_requested_skill(row: dict, requested_skills: list[str]) -> str | None:
+    """Return the canonical requested skill label that matches this bank row, if any."""
+    row_skill = str(row.get("skill") or "").strip().lower()
+    if not row_skill:
+        return None
+    for sk in requested_skills:
+        sk_norm = sk.strip()
+        if not sk_norm:
+            continue
+        sk_lower = sk_norm.lower()
+        if row_skill == sk_lower or sk_lower in row_skill or row_skill in sk_lower:
+            return sk_norm
+    return None
+
+
+def _row_bucket_key(row: dict, requested_skills: list[str]) -> tuple[str, str, str] | None:
+    """Bucket key (skill, category, difficulty) for balanced selection."""
+    skill_label = (
+        _row_matches_requested_skill(row, requested_skills)
+        if requested_skills
+        else str(row.get("skill") or "").strip()
+    )
+    if requested_skills and not skill_label:
+        return None
+    skill = (skill_label or "_any").strip().lower()
+    category = str(row.get("category") or "").strip().lower() or "_any"
+    difficulty = str(row.get("difficulty") or "").strip().lower() or "_any"
+    return (skill, category, difficulty)
+
+
+def _pick_balanced_selection(
+    rows: list[dict],
+    *,
+    requested_skills: list[str],
+    requested_categories: list[str],
+    requested_difficulties: list[str],
+    count: int,
+    randomize: bool,
+    rng: Any,
+) -> list[dict]:
+    """Round-robin across skill × category × difficulty buckets for even coverage."""
+    if not rows:
+        return []
+    count = max(1, count)
+    skills = [s.strip() for s in requested_skills if str(s).strip()]
+    categories = [c.strip().lower() for c in requested_categories if str(c).strip()]
+    difficulties = [d.strip().lower() for d in requested_difficulties if str(d).strip()]
+
+    buckets: dict[tuple[str, str, str], list[dict]] = {}
+    overflow: list[dict] = []
+    for row in rows:
+        key = _row_bucket_key(row, skills)
+        if key is None:
+            overflow.append(row)
+            continue
+        buckets.setdefault(key, []).append(row)
+
+    if not buckets:
+        if randomize:
+            rng.shuffle(rows)
+        return rows[:count]
+
+    if randomize:
+        for pool in buckets.values():
+            rng.shuffle(pool)
+        rng.shuffle(overflow)
+
+    def _bucket_order(key: tuple[str, str, str]) -> tuple[int, int, int]:
+        sk, cat, diff = key
+        sk_idx = next((i for i, s in enumerate(skills) if s.lower() == sk), 999)
+        cat_idx = next((i for i, c in enumerate(categories) if c == cat), 999) if categories else 0
+        diff_idx = next((i for i, d in enumerate(difficulties) if d == diff), 999) if difficulties else 0
+        return (sk_idx, diff_idx, cat_idx)
+
+    selected: list[dict] = []
+    seen_ids: set[str] = set()
+    active_keys = sorted(buckets.keys(), key=_bucket_order)
+
+    while len(selected) < count and active_keys:
+        progressed = False
+        next_keys: list[tuple[str, str, str]] = []
+        for key in active_keys:
+            if len(selected) >= count:
+                break
+            pool = buckets.get(key) or []
+            picked: dict | None = None
+            while pool:
+                candidate = pool.pop(0)
+                cid = str(candidate.get("id") or "")
+                if cid and cid in seen_ids:
+                    continue
+                picked = candidate
+                break
+            if picked is not None:
+                selected.append(picked)
+                cid = str(picked.get("id") or "")
+                if cid:
+                    seen_ids.add(cid)
+                progressed = True
+            if pool:
+                next_keys.append(key)
+        active_keys = next_keys
+        if not progressed:
+            break
+
+    if len(selected) < count:
+        remainder: list[dict] = []
+        for key in sorted(buckets.keys(), key=_bucket_order):
+            remainder.extend(buckets.get(key) or [])
+        remainder.extend(overflow)
+        if randomize:
+            rng.shuffle(remainder)
+        for row in remainder:
+            if len(selected) >= count:
+                break
+            cid = str(row.get("id") or "")
+            if cid and cid in seen_ids:
+                continue
+            selected.append(row)
+            if cid:
+                seen_ids.add(cid)
+
+    if randomize and len(selected) > 1:
+        rng.shuffle(selected)
+    return selected[:count]
+
+
+def _pick_balanced_by_skill(
+    rows: list[dict],
+    requested_skills: list[str],
+    count: int,
+    *,
+    randomize: bool,
+    rng: Any,
+) -> list[dict]:
+    """Backward-compatible wrapper — balances by skill only."""
+    return _pick_balanced_selection(
+        rows,
+        requested_skills=requested_skills,
+        requested_categories=[],
+        requested_difficulties=[],
+        count=count,
+        randomize=randomize,
+        rng=rng,
+    )
+
+
 def count_questions_for_interview(
     db_target: str | Path,
     *,
@@ -1137,8 +1374,10 @@ def count_questions_for_interview(
 ) -> int:
     clauses = ["is_active = TRUE"] if _is_postgres(db_target) else ["is_active = 1"]
     params: list[Any] = []
-    _append_role_filter(clauses, params, db_target, role, skills)
-    _append_skills_filter(clauses, params, db_target, skills)
+    norm_skills = [s.strip() for s in (skills or []) if str(s).strip()]
+    if _should_apply_role_filter(role, norm_skills):
+        _append_role_filter(clauses, params, db_target, role, norm_skills)
+    _append_skills_filter(clauses, params, db_target, norm_skills)
     _append_interview_filters(
         clauses,
         params,
@@ -1170,14 +1409,19 @@ def select_questions_for_interview(
     avoid_hashes: set[str] | None = None,
     excluded_ids: set[str] | list[str] | None = None,
     seed: str = "",
+    balance_skills: list[str] | None = None,
+    balance_categories: list[str] | None = None,
+    balance_difficulties: list[str] | None = None,
 ) -> list[dict]:
     import hashlib
     import random
 
     clauses = ["is_active = TRUE"] if _is_postgres(db_target) else ["is_active = 1"]
     params: list[Any] = []
-    _append_role_filter(clauses, params, db_target, role, skills)
-    _append_skills_filter(clauses, params, db_target, skills)
+    norm_skills = [s.strip() for s in (skills or []) if str(s).strip()]
+    if _should_apply_role_filter(role, norm_skills):
+        _append_role_filter(clauses, params, db_target, role, norm_skills)
+    _append_skills_filter(clauses, params, db_target, norm_skills)
     _append_interview_filters(
         clauses,
         params,
@@ -1240,10 +1484,78 @@ def select_questions_for_interview(
             continue
         seen_hashes.add(h)
         unique.append(row)
-    if randomize and unique:
-        rng = random.Random(int(hashlib.sha256(seed.encode()).hexdigest()[:16], 16) if seed else None)
-        rng.shuffle(unique)
-    return unique[: max(1, count)]
+    rng = random.Random(int(hashlib.sha256(seed.encode()).hexdigest()[:16], 16) if seed else None)
+    balance_skill_list = [s.strip() for s in (balance_skills or norm_skills) if str(s).strip()]
+    balance_cat_list = _normalize_filter_values(
+        balance_categories if balance_categories is not None else category,
+        allowed={"technical", "behavioral", "situational", "general"},
+    )
+    balance_diff_list = _normalize_filter_values(
+        balance_difficulties if balance_difficulties is not None else difficulty,
+        allowed={"easy", "medium", "hard"},
+    )
+    if unique:
+        return _pick_balanced_selection(
+            unique,
+            requested_skills=balance_skill_list,
+            requested_categories=balance_cat_list,
+            requested_difficulties=balance_diff_list,
+            count=count,
+            randomize=randomize,
+            rng=rng,
+        )
+    return []
+
+
+def lookup_expected_answers_by_hashes(
+    db_target: str | Path,
+    hashes: Sequence[str],
+) -> dict[str, str]:
+    """Return question_hash -> expected_answer for active bank rows."""
+    wanted = sorted({str(h or "").strip() for h in (hashes or []) if str(h or "").strip()})
+    if not wanted:
+        return {}
+    out: dict[str, str] = {}
+    ph = "%s" if _is_postgres(db_target) else "?"
+    placeholders = ", ".join([ph] * len(wanted))
+    approval_clause = "AND approval_status = 'approved'" if qb_require_approval() else ""
+    if _is_postgres(db_target):
+        sql = f"""
+            SELECT question_hash, expected_answer
+            FROM question_bank
+            WHERE is_active = TRUE
+              AND COALESCE(TRIM(expected_answer), '') <> ''
+              {approval_clause}
+              AND question_hash IN ({placeholders})
+        """
+    else:
+        sql = f"""
+            SELECT question_hash, expected_answer
+            FROM question_bank
+            WHERE is_active = 1
+              AND TRIM(COALESCE(expected_answer, '')) <> ''
+              {approval_clause}
+              AND question_hash IN ({placeholders})
+        """
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(wanted))
+                rows = cur.fetchall() or []
+        else:
+            cur = conn.cursor()
+            cur.execute(sql, tuple(wanted))
+            rows = cur.fetchall() or []
+    for row in rows:
+        if isinstance(row, dict):
+            h = str(row.get("question_hash") or "").strip()
+            expected = str(row.get("expected_answer") or "").strip()
+        else:
+            h = str(row[0] or "").strip()
+            expected = str(row[1] or "").strip()
+        if h and expected and h not in out:
+            out[h] = expected
+    return out
 
 
 def persist_interview_questions(
@@ -1466,3 +1778,184 @@ def save_evaluation_result(db_target: str | Path, candidate_answer_id: str, row:
             )
             conn.commit()
     return eid
+
+
+def _save_question_version_snapshot(
+    db_target: str | Path,
+    question_row: dict,
+    *,
+    actor: str = "",
+    note: str = "",
+) -> None:
+    _ensure_question_bank_versions_table(db_target)
+    qid = str(question_row.get("id") or "").strip()
+    if not qid:
+        return
+    vid = str(uuid4())
+    ver = int(question_row.get("version") or 1)
+    row = (
+        vid,
+        qid,
+        ver,
+        str(question_row.get("question") or ""),
+        str(question_row.get("expectedAnswer") or question_row.get("expected_answer") or ""),
+        str(question_row.get("approvalStatus") or question_row.get("approval_status") or "approved"),
+        actor,
+        note,
+        _now_iso(),
+    )
+    ph = "%s" if _is_postgres(db_target) else "?"
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO question_bank_versions
+                    (id, question_id, version, question, expected_answer, approval_status,
+                     changed_by, change_note, changed_at)
+                    VALUES ({", ".join([ph] * 9)})
+                    """,
+                    row,
+                )
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                INSERT INTO question_bank_versions
+                (id, question_id, version, question, expected_answer, approval_status,
+                 changed_by, change_note, changed_at)
+                VALUES ({", ".join([ph] * 9)})
+                """,
+                row,
+            )
+            conn.commit()
+
+
+def get_question_versions(db_target: str | Path, question_id: str) -> list[dict]:
+    _ensure_question_bank_versions_table(db_target)
+    ph = "%s" if _is_postgres(db_target) else "?"
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, question_id, version, question, expected_answer, approval_status,
+                           changed_by, change_note, changed_at
+                    FROM question_bank_versions
+                    WHERE question_id = {ph}
+                    ORDER BY version DESC, changed_at DESC
+                    """,
+                    (question_id,),
+                )
+                rows = cur.fetchall() or []
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT id, question_id, version, question, expected_answer, approval_status,
+                       changed_by, change_note, changed_at
+                FROM question_bank_versions
+                WHERE question_id = ?
+                ORDER BY version DESC, changed_at DESC
+                """,
+                (question_id,),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+    out: list[dict] = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(dict(row))
+        else:
+            out.append(
+                {
+                    "id": row[0],
+                    "question_id": row[1],
+                    "version": row[2],
+                    "question": row[3],
+                    "expected_answer": row[4],
+                    "approval_status": row[5],
+                    "changed_by": row[6],
+                    "change_note": row[7],
+                    "changed_at": row[8],
+                }
+            )
+    return out
+
+
+def list_pending_questions(db_target: str | Path, *, page: int = 1, page_size: int = 25) -> dict:
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 25), 200))
+    offset = (page - 1) * page_size
+    ph = "%s" if _is_postgres(db_target) else "?"
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM question_bank WHERE approval_status = 'pending' AND is_active = TRUE"
+                )
+                total = int((cur.fetchone() or [0])[0])
+                cur.execute(
+                    f"""
+                    SELECT {_select_columns()}
+                    FROM question_bank
+                    WHERE approval_status = 'pending' AND is_active = TRUE
+                    ORDER BY updated_at DESC
+                    LIMIT {ph} OFFSET {ph}
+                    """,
+                    (page_size, offset),
+                )
+                rows = [_question_api(_row_to_dict(r)) for r in (cur.fetchall() or [])]
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM question_bank WHERE approval_status = 'pending' AND is_active = 1"
+            )
+            total = int((cur.fetchone() or [0])[0])
+            cur.execute(
+                f"""
+                SELECT {_select_columns()}
+                FROM question_bank
+                WHERE approval_status = 'pending' AND is_active = 1
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (page_size, offset),
+            )
+            rows = [_question_api(_row_to_dict(dict(r))) for r in (cur.fetchall() or [])]
+    return {"items": rows, "total": total, "page": page, "pageSize": page_size}
+
+
+def set_question_approval_status(
+    db_target: str | Path,
+    question_id: str,
+    status: str,
+    *,
+    actor: str = "",
+    note: str = "",
+) -> dict:
+    status_clean = str(status or "").strip().lower()
+    if status_clean not in VALID_APPROVAL_STATUSES:
+        raise ValueError("Invalid approval status")
+    existing = get_question(db_target, question_id)
+    if not existing:
+        raise ValueError("Question not found")
+    if status_clean == existing.get("approvalStatus"):
+        return existing
+    _save_question_version_snapshot(db_target, existing, actor=actor, note=note or f"approval:{status_clean}")
+    ph = "%s" if _is_postgres(db_target) else "?"
+    now = _now_iso()
+    with _connect(db_target) as conn:
+        if _is_postgres(db_target):
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE question_bank SET approval_status = {ph}, updated_at = {ph} WHERE id = {ph}",
+                    (status_clean, now, question_id),
+                )
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE question_bank SET approval_status = ?, updated_at = ? WHERE id = ?",
+                (status_clean, now, question_id),
+            )
+            conn.commit()
+    return get_question(db_target, question_id) or {}

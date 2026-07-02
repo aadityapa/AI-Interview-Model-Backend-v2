@@ -72,7 +72,7 @@ def test_record_question_registry_and_ensure_unique():
     assert not question_too_similar(session["questions"][1], session["meta"]["asked_questions"])
 
 
-def test_manual_questions_also_deduped():
+def test_manual_questions_not_replaced_by_dedupe():
     session = {
         "current": 1,
         "questions": ["Manual Q1", "Manual Q1 paraphrase?", "Manual Q3"],
@@ -80,6 +80,7 @@ def test_manual_questions_also_deduped():
         "meta": {
             "interview_id": "int-manual",
             "question_source": "manual",
+            "generation_mode": "manual",
             "asked_questions": ["Manual Q1"],
             "jd_text": "Role",
             "jd_skills": ["skill"],
@@ -87,5 +88,30 @@ def test_manual_questions_also_deduped():
         },
     }
     replaced = ensure_unique_served_question(session)
-    assert replaced is True
-    assert session["questions"][1] != "Manual Q1 paraphrase?"
+    assert replaced is False
+    assert session["questions"][1] == "Manual Q1 paraphrase?"
+
+
+def test_question_bank_not_replaced_by_dedupe():
+    session = {
+        "current": 1,
+        "questions": [
+            "Please introduce yourself.",
+            "What is the difference between is and ==?",
+            "What are sets in Python?",
+        ],
+        "answers": ["skip"],
+        "meta": {
+            "interview_id": "int-qb",
+            "question_source": "QUESTION_BANK",
+            "generation_mode": "question_bank",
+            "asked_questions": ["Please introduce yourself."],
+            "warmup_indices": [0],
+            "jd_text": "Python developer",
+            "jd_skills": ["python"],
+            "session_difficulty": "medium",
+        },
+    }
+    replaced = ensure_unique_served_question(session)
+    assert replaced is False
+    assert session["questions"][1] == "What is the difference between is and ==?"

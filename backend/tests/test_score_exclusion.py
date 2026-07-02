@@ -7,6 +7,11 @@ def _sample_report():
     return {
         "overall_score": 6.25,
         "recommendation": "Consider",
+        "communication_evaluation": {
+            "communication_score": 6.5,
+            "presentation_score": 7.0,
+            "summary": "Adequate communication.",
+        },
         "per_question": [
             {"question_index": 1, "score": 8.0, "strengths": ["Clear"], "weaknesses": [], "feedback": "Good"},
             {"question_index": 2, "score": 7.5, "strengths": ["Solid"], "weaknesses": [], "feedback": "Good"},
@@ -32,7 +37,8 @@ def test_exclude_recomputes_mean_without_deleted_rows():
     assert row3["excluded_from_score"] is True
     assert row3["excluded_by"] == "John HR"
     assert row3["excluded_reason"] == "Not relevant to role"
-    assert out["overall_score"] == 8.17
+    assert out["score_reasons"]["technical"]["score"] == 82
+    assert out["overall_score_percent"] == float(out["score_reasons"]["overall"]["score"])
     summ = out["scoring_summary"]
     assert summ["excluded_questions"] == 1
     assert summ["evaluated_questions"] == 3
@@ -55,7 +61,7 @@ def test_recompute_respects_existing_exclusions():
     qs = ["Q1", "Q2", "Q3", "Q4"]
     ans = ["A1 long enough.", "A2 long enough.", "A3 long enough.", "A4 long enough."]
     out = recompute_report_aggregates(report, qs, ans)
-    assert out["overall_score"] == 8.17
+    assert out["score_reasons"]["technical"]["score"] == 82
     assert out["scoring_summary"]["excluded_questions"] == 1
 
 

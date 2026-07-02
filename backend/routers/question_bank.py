@@ -16,11 +16,14 @@ from services.question_bank.repository import (
     export_questions_csv,
     get_dashboard_stats,
     get_question,
+    get_question_versions,
+    list_pending_questions,
     list_questions,
     list_roles_from_questions,
     list_skills,
     list_upload_history,
     set_question_active,
+    set_question_approval_status,
     update_question,
 )
 
@@ -324,3 +327,67 @@ def seed_sample_questions(request: Request):
     if result.get("error"):
         return JSONResponse(result, status_code=400)
     return result
+
+
+@router.get("/pending")
+def pending_questions(request: Request, page: int = 1, pageSize: int = 25):
+    user, err = _auth_super_admin(request)
+    if err:
+        return err
+    from utils.rbac import has_permission
+
+    if not has_permission(user, "qb.approve", is_super_admin=True):
+        return JSONResponse({"error": "Forbidden for this role."}, status_code=403)
+    return list_pending_questions(_AUTH_DB_TARGET, page=page, page_size=pageSize)
+
+
+@router.post("/questions/{question_id}/approve")
+async def approve_question(request: Request, question_id: str):
+    user, err = _auth_super_admin(request)
+    if err:
+        return err
+    from utils.rbac import has_permission
+
+    if not has_permission(user, "qb.approve", is_super_admin=True):
+        return JSONResponse({"error": "Forbidden for this role."}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    note = str((body or {}).get("note") or "").strip()
+    actor = str((user or {}).get("sub") or (user or {}).get("email") or "")
+    try:
+        row = set_question_approval_status(_AUTH_DB_TARGET, question_id, "approved", actor=actor, note=note)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {"status": "ok", "question": row}
+
+
+@router.post("/questions/{question_id}/reject")
+async def reject_question(request: Request, question_id: str):
+    user, err = _auth_super_admin(request)
+    if err:
+        return err
+    from utils.rbac import has_permission
+
+    if not has_permission(user, "qb.approve", is_super_admin=True):
+        return JSONResponse({"error": "Forbidden for this role."}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    note = str((body or {}).get("note") or "").strip()
+    actor = str((user or {}).get("sub") or (user or {}).get("email") or "")
+    try:
+        row = set_question_approval_status(_AUTH_DB_TARGET, question_id, "rejected", actor=actor, note=note)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {"status": "ok", "question": row}
+
+
+@router.get("/questions/{question_id}/versions")
+def question_versions(request: Request, question_id: str):
+    _, err = _auth_super_admin(request)
+    if err:
+        return err
+    return {"versions": get_question_versions(_AUTH_DB_TARGET, question_id)}

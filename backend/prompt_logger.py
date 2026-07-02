@@ -627,8 +627,14 @@ def query_prompt_logs(
     order = "ASC" if sort_order.lower() == "asc" else "DESC"
 
     count_sql = f"SELECT COUNT(*) FROM ai_prompt_logs WHERE {where}"
+    list_cols = (
+        "id, template_id, template_name, candidate_id, candidate_name, candidate_role, "
+        "interview_id, selected_skills, difficulty, call_type, model, "
+        "prompt_tokens, completion_tokens, total_tokens, temperature, max_tokens, "
+        "response_time_ms, status, error_log, created_at, created_at_ist, created_date_ist, created_time_ist"
+    )
     data_sql = (
-        f"SELECT * FROM ai_prompt_logs WHERE {where} "
+        f"SELECT {list_cols} FROM ai_prompt_logs WHERE {where} "
         f"ORDER BY {col} {order} LIMIT {ph} OFFSET {ph}"
     )
     params_data = params + [limit, offset]

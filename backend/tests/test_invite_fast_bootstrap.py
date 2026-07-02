@@ -82,6 +82,38 @@ def test_fast_bootstrap_skips_openai(monkeypatch):
     sessions.pop(skey, None)
 
 
+def test_bootstrap_rebuilds_empty_unplayable_memory_session(monkeypatch):
+    token = "empty-memory-session"
+    skey = f"inv:{token}"
+    sessions[skey] = {"questions": [], "current": 0, "answers": [], "meta": {}}
+
+    schedule = {
+        "candidate_name": "Test User",
+        "candidate_email": "empty@example.com",
+        "scheduled_at_local": "2026-06-04 12:00",
+        "notes": "",
+    }
+
+    monkeypatch.setattr("main.get_interview_progress_by_invite", lambda *a, **k: None)
+    monkeypatch.setattr("main._persist_interview_progress", lambda *a, **k: None)
+    monkeypatch.setattr("main.get_job_template", lambda *a, **k: None)
+    monkeypatch.setattr("main.list_job_templates", lambda *a, **k: [])
+    monkeypatch.setattr("main.generate_questions_fallback", lambda *a, **k: ["Fallback Q1?", "Fallback Q2?"])
+
+    result = _bootstrap_invite_interview_session(token, schedule, fast_only=True)
+
+    assert result.get("error") is None
+    assert len(sessions[skey].get("questions") or []) >= 1
+    sessions.pop(skey, None)
+
+
+def test_invite_session_playable_requires_questions():
+    from utils.invite_session_guard import invite_session_playable
+
+    assert not invite_session_playable({"questions": [], "current": 0, "answers": []})
+    assert invite_session_playable({"questions": ["Q1?"], "current": 0, "answers": []})
+
+
 def test_wait_for_prewarm_returns_when_session_ready(monkeypatch):
     token = "wait-prewarm-token"
     skey = f"inv:{token}"

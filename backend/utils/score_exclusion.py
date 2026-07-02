@@ -8,6 +8,7 @@ from typing import Any
 from ai import (
     answer_turn_is_valid_for_scoring,
     apply_decimal_scores_to_report,
+    apply_interview_score_model,
     format_decimal_score,
     format_percent_from_ten_scale,
     scoring_rollup_counts,
@@ -124,21 +125,8 @@ def recompute_report_aggregates(
 
     _sync_row_aliases(out, rows)
     out["attempted_questions_only"] = True
-    out["overall_score"] = mean_evaluated
-    out["overall_score_percent"] = format_percent_from_ten_scale(mean_evaluated)
-    out["technical_score"] = mean_evaluated
-    out["problem_solving_score"] = mean_evaluated
 
-    # Preserve communication_evaluation from the original report — HR exclusion
-    # moderates technical per-question aggregates, not comm/presentation scores.
-
-    dims = out.get("scoring_dimensions")
-    if isinstance(dims, dict):
-        dims = dict(dims)
-        for key in ("communication", "technical", "confidence", "problem_solving", "overall"):
-            if key in dims or key == "overall":
-                dims[key] = mean_evaluated
-        out["scoring_dimensions"] = dims
+    out = apply_interview_score_model(out, qs, ans, session_meta=None)
 
     ss = dict(out.get("scoring_summary") or {}) if isinstance(out.get("scoring_summary"), dict) else {}
     ss.update(
@@ -150,16 +138,16 @@ def recompute_report_aggregates(
             "active_questions": evaluated_count,
             "excluded_questions": excluded_count,
             "total_questions": len(rows),
-            "mean_score_on_evaluated": mean_evaluated,
-            "overall_score_percent": format_percent_from_ten_scale(mean_evaluated),
             "policy": "final_aggregates_exclude_hr_moderated_questions",
         }
     )
     out["scoring_summary"] = ss
 
+    mean_evaluated = float(out.get("overall_score") or 0.0)
+
     ss_list = out.get("skill_scores")
     if isinstance(ss_list, list):
-        mt = float(mean_evaluated)
+        mt = float(out.get("technical_score") or mean_evaluated)
         for row in ss_list:
             if not isinstance(row, dict):
                 continue

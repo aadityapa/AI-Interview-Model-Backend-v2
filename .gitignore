@@ -2,10 +2,13 @@ backend/certs/*.pem
 .env
 .env.*
 !.env.example
+logs/
+backend/logs/
 logs/server.log
 logs/*.log
 logs/*.recovered*.txt
 logs/openai-prompts/
+data/question_bank_errors/import_errors_*.txt
 __pycache__/
 *.pyc
 node_modules/

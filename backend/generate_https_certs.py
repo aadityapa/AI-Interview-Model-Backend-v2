@@ -9,13 +9,55 @@ from __future__ import annotations
 import datetime
 from datetime import timezone
 import ipaddress
+import os
 import socket
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+def _load_root_env() -> None:
+    root = Path(__file__).resolve().parent.parent
+    env_path = root / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+def _extra_cert_ipv4s() -> list[str]:
+    out: list[str] = []
+    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+    if pub and pub.lower() != "auto":
+        host = (urlparse(pub).hostname or "").strip()
+        if host and host not in {"localhost", "127.0.0.1", "::1"}:
+            try:
+                ipaddress.IPv4Address(host)
+                out.append(host)
+            except ValueError:
+                pass
+    for part in (os.getenv("CERT_EXTRA_IPS") or "").split(","):
+        ip = part.strip()
+        if not ip:
+            continue
+        try:
+            ipaddress.IPv4Address(ip)
+            if ip not in out:
+                out.append(ip)
+        except ValueError:
+            pass
+    return out
 
 
 def _detect_lan_ipv4() -> str | None:
@@ -31,6 +73,7 @@ def _detect_lan_ipv4() -> str | None:
 
 
 def main() -> int:
+    _load_root_env()
     cert_dir = Path(__file__).resolve().parent / "certs"
     cert_dir.mkdir(parents=True, exist_ok=True)
     key_path = cert_dir / "key.pem"
@@ -49,11 +92,17 @@ def main() -> int:
         x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
         x509.IPAddress(ipaddress.IPv6Address("::1")),
     ]
+    cert_ips: list[str] = []
     lip = _detect_lan_ipv4()
     if lip:
+        cert_ips.append(lip)
+    for ip in _extra_cert_ipv4s():
+        if ip not in cert_ips:
+            cert_ips.append(ip)
+    for ip in cert_ips:
         try:
-            san_list.append(x509.IPAddress(ipaddress.IPv4Address(lip)))
-            print(f"Including LAN IP in certificate: {lip}")
+            san_list.append(x509.IPAddress(ipaddress.IPv4Address(ip)))
+            print(f"Including LAN IP in certificate: {ip}")
         except ValueError:
             pass
 

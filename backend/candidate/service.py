@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+
 from utils.auto_advance import auto_advance_api_payload
+from utils.invite_session_guard import refill_question_bank_pool_if_needed
 from utils.question_uniqueness import ensure_unique_served_question, record_question_registry, remember_asked_question
 from utils.time_warnings import time_warnings_api_payload
 from utils.warmup import (
@@ -10,6 +13,8 @@ from utils.warmup import (
     is_warmup_index,
     question_type_for_index,
 )
+
+logger = logging.getLogger(__name__)
 
 def _evaluated_total(session: dict) -> int:
     """Total questions excluding the (optional) warmup, for UI progress display.
@@ -58,55 +63,71 @@ def _count_mode_question_cap(session: dict) -> int | None:
     return nq + len(warm)
 
 
-def next_question_payload(session: dict) -> dict:
+def _completion_payload(session: dict, meta: dict, skills: list) -> dict:
+    out = {
+        "message": "Interview completed",
+        "skills": skills,
+        "index": _evaluated_total(session),
+        "total": _evaluated_total(session),
+        "show_spoken_text": bool(meta.get("show_spoken_text", False)),
+        "enable_transcript_input": bool(meta.get("enable_transcript_input", meta.get("show_spoken_text", False))),
+        "mic_always_on": bool(meta.get("mic_always_on", False)),
+        "timing_mode": str(meta.get("timing_mode") or "count"),
+        "time_limit_sec": int(meta.get("time_limit_sec") or 0),
+        "time_warnings": time_warnings_api_payload(meta),
+        "session_difficulty": str(meta.get("session_difficulty") or meta.get("difficulty") or "medium"),
+        "auto_advance": auto_advance_api_payload(meta),
+    }
+    if meta.get("last_turn_score") is not None:
+        out["last_turn_score"] = meta.get("last_turn_score")
+        out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
+    return out
+
+
+def next_question_payload(session: dict, *, db_target: str | None = None) -> dict:
+    if db_target:
+        try:
+            refill_question_bank_pool_if_needed(session, db_target)
+        except Exception:
+            pass
     meta = session.get("meta", {})
     skills = meta.get("jd_skills", []) or []
     cap = _count_mode_question_cap(session)
     cur = int(session.get("current") or 0)
     if cap is not None and cur >= cap:
         session["completed"] = True
-        out = {
-            "message": "Interview completed",
-            "skills": skills,
-            "index": _evaluated_total(session),
-            "total": _evaluated_total(session),
-            "show_spoken_text": bool(meta.get("show_spoken_text", False)),
-            "enable_transcript_input": bool(meta.get("enable_transcript_input", meta.get("show_spoken_text", False))),
-            "mic_always_on": bool(meta.get("mic_always_on", False)),
-            "timing_mode": str(meta.get("timing_mode") or "count"),
-            "time_limit_sec": int(meta.get("time_limit_sec") or 0),
-            "time_warnings": time_warnings_api_payload(meta),
-            "session_difficulty": str(meta.get("session_difficulty") or meta.get("difficulty") or "medium"),
-            "auto_advance": auto_advance_api_payload(meta),
-        }
-        if meta.get("last_turn_score") is not None:
-            out["last_turn_score"] = meta.get("last_turn_score")
-            out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
-        return out
+        return _completion_payload(session, meta, skills)
     if session["current"] >= len(session["questions"]):
-        session["completed"] = True
-        out = {
-            "message": "Interview completed",
-            "skills": skills,
-            "index": _evaluated_total(session),
-            "total": _evaluated_total(session),
-            "show_spoken_text": bool(meta.get("show_spoken_text", False)),
-            "enable_transcript_input": bool(meta.get("enable_transcript_input", meta.get("show_spoken_text", False))),
-            "mic_always_on": bool(meta.get("mic_always_on", False)),
-            "timing_mode": str(meta.get("timing_mode") or "count"),
-            "time_limit_sec": int(meta.get("time_limit_sec") or 0),
-            "time_warnings": time_warnings_api_payload(meta),
-            "session_difficulty": str(meta.get("session_difficulty") or meta.get("difficulty") or "medium"),
-            "auto_advance": auto_advance_api_payload(meta),
-        }
-        if meta.get("last_turn_score") is not None:
-            out["last_turn_score"] = meta.get("last_turn_score")
-            out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
-        return out
+        if cap is not None and cur < cap and db_target:
+            try:
+                refill_question_bank_pool_if_needed(session, db_target)
+            except Exception:
+                pass
+        if session["current"] >= len(session["questions"]):
+            session["completed"] = True
+            return _completion_payload(session, meta, skills)
     ensure_unique_served_question(session)
     q = session["questions"][session["current"]]
     remember_asked_question(session, q)
     qnum = int(session["current"]) + 1
+    snapshot = meta.get("question_bank_snapshot") if isinstance(meta.get("question_bank_snapshot"), dict) else {}
+    snap_entry = snapshot.get(str(session["current"])) if isinstance(snapshot, dict) else None
+    question_id = str((snap_entry or {}).get("question_id") or "").strip()
+    q_source = str(meta.get("question_source") or "dynamic")
+    logger.info(
+        "interview.next_question",
+        extra={
+            "event": "interview.next_question",
+            "template_id": str(meta.get("job_id") or ""),
+            "question_type": str(meta.get("generation_mode") or q_source),
+            "question_source": q_source,
+            "question_ids": [question_id] if question_id else [],
+            "question_origin": q_source,
+            "openai_generation_called": "NO",
+            "question_index": qnum,
+            "question_preview": str(q or "")[:120],
+        },
+    )
     record_question_registry(
         session,
         question_number=qnum,

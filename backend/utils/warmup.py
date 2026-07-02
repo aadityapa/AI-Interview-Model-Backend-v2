@@ -7,12 +7,11 @@ every interview so candidates can settle in, verify their audio pipeline and
 practise speaking before the scored portion begins.
 
 Design rules:
-  * The warmup is PURELY for candidate comfort. It must not influence:
-      - skill scoring
-      - communication scoring
-      - hiring analytics
-      - learning corpus (`learning.jsonl` via `append_interview_turn`)
-      - HR report records (`questions` / `answers` slices)
+  * The warmup must not influence technical scoring or hiring analytics.
+  * It DOES contribute to communication / confidence rubric scores via a
+    separate ``introduction_evaluation`` block on the report (Jun 2026).
+  * It is excluded from HR report ``questions`` / ``answers`` slices and from
+    the learning corpus (`learning.jsonl` via `append_interview_turn`).
   * It IS counted in:
       - the live interview timer (timer starts on the warmup question — that
         is part of the spec, the candidate uses the warmup time too).
@@ -32,7 +31,9 @@ Public API:
   * `filter_out_warmups(q, a, meta)` - strip warmup entries from Q/A lists.
   * `stamp_introduction_question_types(meta, indices)` - mark INTRODUCTION types.
   * `question_type_for_index(meta, idx)` - TECHNICAL vs INTRODUCTION.
-  * `is_scoring_excluded_index(meta, idx)` - excluded from scored aggregates.
+  * `is_scoring_excluded_index(meta, idx)` - excluded from technical aggregates.
+  * `extract_warmup_qa(questions, answers, meta)` - first warmup Q/A pair.
+  * `meta_for_filtered_qa_evaluation(meta, questions)` - fix index alignment after filter.
 """
 
 from __future__ import annotations
@@ -119,6 +120,61 @@ def is_warmup_index(meta: dict | None, idx: int) -> bool:
     except (TypeError, ValueError):
         return False
     return i in _coerce_indices(meta)
+
+
+def extract_warmup_qa(
+    questions: Iterable[str] | None,
+    answers: Iterable[str] | None,
+    meta: dict | None,
+) -> Tuple[str, str]:
+    """Return the first warmup question/answer pair (empty strings when absent)."""
+    wm = _coerce_indices(meta)
+    if not wm:
+        return "", ""
+    q_in = list(questions or [])
+    a_in = list(answers or [])
+    for idx in sorted(wm):
+        if idx < 0 or idx >= len(q_in):
+            continue
+        q = str(q_in[idx] or "").strip()
+        a = str(a_in[idx] if idx < len(a_in) else "").strip()
+        if q:
+            return q, a
+    return "", ""
+
+
+def meta_for_filtered_qa_evaluation(meta: dict | None, questions: Sequence[str] | None) -> dict | None:
+    """Align warmup markers when ``questions`` were already passed through ``filter_out_warmups``.
+
+    Without this, index 0 in a filtered list is still treated as INTRODUCTION because
+    ``meta["warmup_indices"]`` refers to the live session list (warmup at session index 0).
+    """
+    if not meta:
+        return meta
+    wm = _coerce_indices(meta)
+    if not wm:
+        return meta
+    qs = [str(q or "").strip() for q in (questions or [])]
+    active_warm = {i for i in wm if 0 <= i < len(qs) and qs[i] == WARMUP_QUESTION_TEXT}
+    if active_warm == wm:
+        return meta
+    out = dict(meta)
+    if active_warm:
+        out["warmup_indices"] = sorted(active_warm)
+    else:
+        out.pop("warmup_indices", None)
+    qt_raw = out.get("question_types")
+    if isinstance(qt_raw, dict):
+        qt = {
+            k: v
+            for k, v in qt_raw.items()
+            if str(v or "").strip().upper() != QUESTION_TYPE_INTRODUCTION
+        }
+        if qt:
+            out["question_types"] = qt
+        else:
+            out.pop("question_types", None)
+    return out
 
 
 def filter_out_warmups(

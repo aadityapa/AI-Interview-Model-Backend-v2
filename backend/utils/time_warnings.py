@@ -67,7 +67,7 @@ def resolve_time_warning_settings(weights: dict | None = None, meta: dict | None
     tts = m.get("time_warnings_tts")
     if tts is None:
         tts = w.get("timeWarningsTts", w.get("time_warnings_tts"))
-    tts_on = _as_bool(tts, True)
+    tts_on = _as_bool(tts, False)
 
     return {
         "enabled": enabled,

@@ -10,25 +10,35 @@ from utils.warmup import filter_out_warmups
 
 
 def build_hr_records_summary(records: list[dict]) -> list[dict]:
+    def _sort_ts(row: dict) -> str:
+        return str(
+            row.get("updated_at")
+            or row.get("updated_at_ist")
+            or row.get("created_at")
+            or row.get("created_at_ist")
+            or ""
+        )
+
     summary = [
         {
             "id": r.get("id", ""),
             "candidate_name": r.get("candidate_name", "Candidate"),
             "candidate_email": r.get("candidate_email", "Not available"),
-            "created_at": r.get("created_at", ""),
-            "updated_at": r.get("updated_at", ""),
+            "created_at": r.get("created_at") or r.get("created_at_ist") or "",
+            "updated_at": _sort_ts(r),
             "created_date_ist": r.get("created_date_ist", ""),
             "created_time_ist": r.get("created_time_ist", ""),
             "updated_date_ist": r.get("updated_date_ist", ""),
             "updated_time_ist": r.get("updated_time_ist", ""),
             "submitted": bool(r.get("submitted")),
-            "has_report": bool(r.get("report")),
+            "has_report": bool(r.get("has_report") if r.get("has_report") is not None else r.get("report")),
             "final_status": r.get("final_status", ""),
             "report_status": r.get("report_status", "ready" if r.get("report") else "pending"),
         }
         for r in records
+        if isinstance(r, dict)
     ]
-    summary.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    summary.sort(key=_sort_ts, reverse=True)
     return summary
 
 

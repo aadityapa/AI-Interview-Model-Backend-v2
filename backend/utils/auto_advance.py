@@ -10,12 +10,13 @@ from typing import Any
 DEFAULTS = {
     "auto_advance_enabled": True,
     "initial_response_wait_sec": 5,
-    "silence_detection_sec": 3,
+    "no_response_extra_wait_sec": 2.5,
+    "silence_detection_sec": 2.5,
     "no_response_countdown_sec": 3,
     "max_no_response_warnings": 3,
     "auto_skip_enabled": True,
     "voice_commands_enabled": True,
-    "confirmation_before_next_sec": 3,
+    "confirmation_before_next_sec": 2.5,
     "minimum_answer_words": 5,
     "minimum_speech_duration_sec": 2,
     "speech_energy_threshold": 0.038,
@@ -46,6 +47,14 @@ def _clamp_sec(raw: Any, fallback: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
+def _clamp_duration(raw: Any, fallback: float, lo: float, hi: float) -> float:
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        n = fallback
+    return max(lo, min(hi, n))
+
+
 def _clamp_float(raw: Any, fallback: float, lo: float, hi: float) -> float:
     try:
         n = float(raw)
@@ -67,7 +76,10 @@ def resolve_auto_advance_settings(weights: dict | None = None, meta: dict | None
             return w[snake]
         return default
 
-    enabled = _as_bool(_pick("auto_advance_enabled", "autoAdvanceEnabled", DEFAULTS["auto_advance_enabled"]), False)
+    enabled = _as_bool(
+        _pick("auto_advance_enabled", "autoAdvanceEnabled", DEFAULTS["auto_advance_enabled"]),
+        DEFAULTS["auto_advance_enabled"],
+    )
 
     return {
         "enabled": enabled,
@@ -77,11 +89,17 @@ def resolve_auto_advance_settings(weights: dict | None = None, meta: dict | None
             2,
             30,
         ),
-        "silence_detection_sec": _clamp_sec(
+        "no_response_extra_wait_sec": _clamp_duration(
+            _pick("no_response_extra_wait_sec", "noResponseExtraWaitSec", DEFAULTS["no_response_extra_wait_sec"]),
+            DEFAULTS["no_response_extra_wait_sec"],
+            1.0,
+            15.0,
+        ),
+        "silence_detection_sec": _clamp_duration(
             _pick("silence_detection_sec", "silenceDetectionSec", DEFAULTS["silence_detection_sec"]),
             DEFAULTS["silence_detection_sec"],
-            2,
-            15,
+            2.5,
+            5.0,
         ),
         "no_response_countdown_sec": _clamp_sec(
             _pick("no_response_countdown_sec", "noResponseCountdownSec", DEFAULTS["no_response_countdown_sec"]),
@@ -103,11 +121,11 @@ def resolve_auto_advance_settings(weights: dict | None = None, meta: dict | None
             _pick("voice_commands_enabled", "voiceCommandsEnabled", DEFAULTS["voice_commands_enabled"]),
             DEFAULTS["voice_commands_enabled"],
         ),
-        "confirmation_before_next_sec": _clamp_sec(
+        "confirmation_before_next_sec": _clamp_duration(
             _pick("confirmation_before_next_sec", "confirmationBeforeNextSec", DEFAULTS["confirmation_before_next_sec"]),
             DEFAULTS["confirmation_before_next_sec"],
-            0,
-            10,
+            0.0,
+            10.0,
         ),
         "minimum_answer_words": _clamp_sec(
             _pick("minimum_answer_words", "minimumAnswerWords", DEFAULTS["minimum_answer_words"]),
@@ -140,6 +158,7 @@ def stamp_auto_advance_settings(meta: dict, weights: dict | None = None) -> None
     cfg = resolve_auto_advance_settings(weights, meta)
     meta["auto_advance_enabled"] = cfg["enabled"]
     meta["initial_response_wait_sec"] = cfg["initial_response_wait_sec"]
+    meta["no_response_extra_wait_sec"] = cfg["no_response_extra_wait_sec"]
     meta["silence_detection_sec"] = cfg["silence_detection_sec"]
     meta["no_response_countdown_sec"] = cfg["no_response_countdown_sec"]
     meta["max_no_response_warnings"] = cfg["max_no_response_warnings"]
@@ -158,6 +177,7 @@ def auto_advance_api_payload(meta: dict | None) -> dict:
     return {
         "enabled": cfg["enabled"],
         "initial_response_wait_sec": cfg["initial_response_wait_sec"],
+        "no_response_extra_wait_sec": cfg["no_response_extra_wait_sec"],
         "silence_detection_sec": cfg["silence_detection_sec"],
         "no_response_countdown_sec": cfg["no_response_countdown_sec"],
         "max_no_response_warnings": cfg["max_no_response_warnings"],

@@ -52,7 +52,8 @@ def test_merge_mean_ignores_introduction_when_present(monkeypatch):
     base = {"overall_score": 9.0, "skill_scores": []}
     qs = [WARMUP_QUESTION_TEXT, "What is CAN?"]
     ans = ["Hi, I am Sam.", "Controller area network."]
-    out = merge_per_question_eval_into_report(base, qs, ans, model="gpt-4o-mini")
+    out = merge_per_question_eval_into_report(base, qs, ans, model="gpt-4o-mini", session_meta={"warmup_indices": [0]})
     assert out["technical_score"] == 8.0
+    assert out["score_reasons"]["technical"]["score"] == 80
     summ = out.get("scoring_summary") or {}
     assert summ.get("evaluated_questions") == 1

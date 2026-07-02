@@ -20,6 +20,15 @@ def test_skip_converts_with_speech_duration_only():
     assert convert is True
 
 
+def test_skip_converts_with_whisper_transcript_field():
+    convert, text = skip_should_convert_to_answer(
+        "skip",
+        {"whisper_transcript": "INNER JOIN filters matching rows.", "speech_duration_ms": 0},
+    )
+    assert convert is True
+    assert text == "INNER JOIN filters matching rows."
+
+
 def test_skip_stays_skip_when_empty():
     convert, text = skip_should_convert_to_answer("skip", {"speech_duration_ms": 0})
     assert convert is False

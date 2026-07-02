@@ -1,6 +1,7 @@
 """Skip answer flow: per-question independence and mixed skip/answer sequences."""
 
 import importlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -91,6 +92,66 @@ def test_manual_skip_with_transcript_converts_to_answer(answer_client):
     assert out["skipped"] is False
     assert sessions["sk-test"]["answers"] == ["Coroutines are async."]
     assert len(eval_calls) == 1
+
+
+def test_auto_skip_blocked_when_speech_detected(answer_client):
+    main, sessions, _state, _eval_calls = answer_client
+    req = SimpleNamespace()
+    meta = json.dumps(
+        {
+            "trigger": "silent_no_response",
+            "skipped": True,
+            "speech_confirmed": True,
+            "word_count": 0,
+        }
+    )
+    out = main.answer(req, ans="skip", action="skip", auto_advance_meta=meta)
+    assert out.status_code == 409
+    body = json.loads(out.body.decode())
+    assert body.get("speech_blocked") is True
+    assert sessions["sk-test"]["answers"] == []
+
+
+def test_auto_skip_converts_when_whisper_transcript_in_meta(answer_client):
+    """Late Whisper transcript in meta must not persist as skip."""
+    main, sessions, _state, eval_calls = answer_client
+    req = SimpleNamespace()
+    meta = json.dumps(
+        {
+            "trigger": "silent_no_response",
+            "skipped": True,
+            "speech_confirmed": False,
+            "word_count": 4,
+            "whisper_transcript": "Spring Boot uses auto configuration.",
+            "capture_text": "Spring Boot uses auto configuration.",
+        }
+    )
+    out = main.answer(req, ans="skip", action="skip", auto_advance_meta=meta)
+    assert out["status"] == "ok"
+    assert out["skipped"] is False
+    assert sessions["sk-test"]["answers"] == ["Spring Boot uses auto configuration."]
+    assert len(eval_calls) == 1
+
+
+def test_true_no_speech_skip_allowed(answer_client):
+    """TEST 5: never spoke — skip is allowed with empty evidence."""
+    main, sessions, _state, eval_calls = answer_client
+    req = SimpleNamespace()
+    meta = json.dumps(
+        {
+            "trigger": "silent_no_response",
+            "skipped": True,
+            "speech_confirmed": False,
+            "word_count": 0,
+            "speech_duration_ms": 0,
+            "interim_transcript": "",
+        }
+    )
+    out = main.answer(req, ans="skip", action="skip", auto_advance_meta=meta)
+    assert out["status"] == "ok"
+    assert out["skipped"] is True
+    assert sessions["sk-test"]["answers"] == ["skip"]
+    assert eval_calls == []
 
 
 def test_answer_after_skip_is_evaluated(answer_client):
