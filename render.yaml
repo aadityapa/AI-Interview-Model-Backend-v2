@@ -35,6 +35,8 @@ services:
         sync: false
       - key: AUTH_DB_URL
         sync: false
+      - key: HR_RECORDS_IMPORT_ON_STARTUP
+        value: "false"
       - key: CORS_ALLOW_ORIGINS
         value: "https://interview.karnex.in,https://ai-interview-model-frontend-v2.vercel.app"
       - key: PUBLIC_BASE_URL

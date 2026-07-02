@@ -91,17 +91,22 @@ def _is_postgres(db_target: DbTarget) -> bool:
 
 
 def normalize_postgres_dsn(dsn: str) -> str:
-    """Ensure SSL for cloud Postgres (Render, etc.) when not localhost."""
+    """Ensure SSL and connect timeout for cloud Postgres (RDS, Supabase, Render)."""
     raw = (dsn or "").strip()
     if not raw or not _is_postgres(raw):
-        return raw
-    if "sslmode=" in raw:
         return raw
     host = (urlparse(raw).hostname or "").lower()
     if host in {"localhost", "127.0.0.1", "postgres"}:
         return raw
+    extras: list[str] = []
+    if "sslmode=" not in raw:
+        extras.append("sslmode=require")
+    if "connect_timeout=" not in raw:
+        extras.append("connect_timeout=15")
+    if not extras:
+        return raw
     sep = "&" if "?" in raw else "?"
-    return f"{raw}{sep}sslmode=require"
+    return f"{raw}{sep}{'&'.join(extras)}"
 
 
 def _connect_sqlite(db_path: Path) -> sqlite3.Connection:

@@ -991,7 +991,9 @@ def _session_key_from_session(session: dict | None) -> str:
 
 def _is_production_env() -> bool:
     env = str(os.getenv("KARNEX_ENV") or os.getenv("ENV") or os.getenv("NODE_ENV") or "").strip().lower()
-    return env in {"production", "prod"}
+    if env in {"production", "prod"}:
+        return True
+    return str(os.getenv("RENDER") or "").strip().lower() in {"1", "true", "yes"}
 
 
 def _default_auth_secrets() -> set[str]:
@@ -2787,6 +2789,37 @@ def version():
     return {"version": _runtime_version(), "service": APP_TITLE}
 
 
+def _boot_init_auth_db(db_target: str) -> None:
+    """Connect to Postgres with retries (RDS cold start / Render cross-region)."""
+    attempts = max(1, min(int(os.getenv("AUTH_DB_BOOT_RETRIES", "6") or "6"), 12))
+    delay_s = max(1.0, min(float(os.getenv("AUTH_DB_BOOT_RETRY_SEC", "5") or "5"), 30.0))
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            init_auth_db(db_target)
+            if attempt > 1:
+                logger.info(
+                    "auth.db.init.ok_after_retry",
+                    extra={"event": "auth.db.init.ok_after_retry", "attempt": attempt},
+                )
+            return
+        except Exception as err:
+            last_err = err
+            logger.warning(
+                "auth.db.init.retry",
+                extra={
+                    "event": "auth.db.init.retry",
+                    "attempt": attempt,
+                    "max_attempts": attempts,
+                    "error": str(err)[:300],
+                },
+            )
+            if attempt < attempts:
+                time.sleep(delay_s)
+    if last_err is not None:
+        raise last_err
+
+
 DATA_FILE = HR_RECORDS_FILE
 
 ensure_project_dirs()
@@ -2806,16 +2839,21 @@ logger.info(
     },
 )
 try:
-    init_auth_db(AUTH_DB_TARGET)
+    _boot_init_auth_db(AUTH_DB_TARGET)
 except Exception as err:
     logger.error(
         "auth.db.init.failed",
         extra={"event": "auth.db.init.failed", "target": str(AUTH_DB_TARGET), "error": str(err)},
     )
     if _auth_db_url_configured:
-        raise
+        host = (urlparse(str(AUTH_DB_TARGET)).hostname or "unknown")
+        raise RuntimeError(
+            f"Database connection failed ({host}). "
+            "Check AUTH_DB_URL on Render, RDS security group inbound on port 5432, "
+            "and that the instance allows public connections."
+        ) from err
     AUTH_DB_TARGET = KARNEX_DB_FILE
-    init_auth_db(AUTH_DB_TARGET)
+    _boot_init_auth_db(AUTH_DB_TARGET)
 try:
     init_prompt_log_table(AUTH_DB_TARGET)
 except Exception as err:

@@ -27,6 +27,17 @@ postgresql://postgres:[PASSWORD]@database-1.xxxxx.ap-south-1.rds.amazonaws.com:5
 
 **RDS security group:** allow inbound **PostgreSQL (5432)** from Render. On the free tier, you may need `0.0.0.0/0` temporarily, or use a paid static outbound IP on Render.
 
+Also enable **Public access** on the RDS instance if Render connects over the internet.
+
+## 2b. Migrating from Supabase to RDS
+
+1. Export from Supabase (pg_dump or Supabase backup).
+2. Import into RDS `karnex_db` (`psql` or pg_restore).
+3. Set `AUTH_DB_URL` on Render to the RDS URI (remove old Supabase URL).
+4. Redeploy and verify `/health/ready` shows `"database_connected": true`.
+
+If deploy fails with **Exited with status 1**, check Render logs for `auth.db.init.failed` — usually RDS security group or wrong `AUTH_DB_URL`.
+
 ## 3. Required Render environment variables
 
 | Variable | Value |
