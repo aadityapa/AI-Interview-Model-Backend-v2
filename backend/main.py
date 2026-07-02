@@ -2755,6 +2755,21 @@ def _start_interview_recovery_worker() -> None:
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
+    # Fingerprint (not the secret) so Render logs reveal if AUTH_SECRET rotated
+    # between deploys — a changed fingerprint invalidates all existing tokens
+    # and causes login->immediate-logout for every user.
+    try:
+        _secret_fp = hashlib.sha256(_auth_secret().encode("utf-8")).hexdigest()[:12]
+        logger.info(
+            "auth.secret.fingerprint",
+            extra={
+                "event": "auth.secret.fingerprint",
+                "fingerprint": _secret_fp,
+                "is_default": _auth_secret_is_default(),
+            },
+        )
+    except Exception:
+        pass
     _start_interview_recovery_worker()
     yield
 

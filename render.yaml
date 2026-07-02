@@ -19,10 +19,15 @@ services:
         value: "false"
       - key: ALLOW_PUBLIC_HR_REGISTRATION
         value: "true"
+      # IMPORTANT: keep these STABLE. Do NOT use generateValue — Render can
+      # regenerate the value on service reconfig/blueprint re-apply, which
+      # rotates the JWT signing key and logs every user out on the next call
+      # (login -> immediate 401 -> auto-logout). Set a fixed long random value
+      # once in the Render dashboard (Environment tab) and never change it.
       - key: AUTH_SECRET
-        generateValue: true
+        sync: false
       - key: REPORT_CODE
-        generateValue: true
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_API_KEY_TTS
