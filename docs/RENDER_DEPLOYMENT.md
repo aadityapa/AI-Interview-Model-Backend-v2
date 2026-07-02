@@ -1,9 +1,9 @@
-# Deploy Backend on Render (Supabase database)
+# Deploy Backend on Render (AWS RDS database)
 
 Repo: [AI-Interview-Model-Backend-v2](https://github.com/aadityapa/AI-Interview-Model-Backend-v2)
 
 - **Backend:** Render Web Service (Docker)
-- **Database:** [Supabase](https://supabase.com) PostgreSQL (not Render Postgres)
+- **Database:** AWS RDS PostgreSQL (or any managed Postgres)
 - **Frontend:** Vercel — production at `https://interview.karnex.in` (preview: `https://ai-interview-model-frontend-v2.vercel.app`)
 
 ## 1. Render Web Service
@@ -11,25 +11,27 @@ Repo: [AI-Interview-Model-Backend-v2](https://github.com/aadityapa/AI-Interview-
 1. [Render Dashboard](https://dashboard.render.com/) → **New** → **Web Service**
 2. Connect `aadityapa/AI-Interview-Model-Backend-v2`
 3. **Runtime:** Docker · **Health check:** `/health/live`
-4. Do **not** add a Render PostgreSQL instance.
+4. Do **not** add a Render PostgreSQL instance — use your external RDS database.
 
-## 2. Supabase connection string
+## 2. AWS RDS connection string
 
-In Supabase: **Project Settings → Database → Connection string → URI** (Session pooler, port 5432).
+In AWS RDS: **Connectivity & security** → copy the endpoint and use your database name (e.g. `karnex_db`).
 
-Set on Render as `AUTH_DB_URL` (paste your full URI). Example shape:
+Set on Render as `AUTH_DB_URL` (or `DATABASE_URL` — both work). Example shape:
 
 ```
-postgresql://postgres.[PROJECT-REF]:[PASSWORD]@aws-0-[region].pooler.supabase.com:5432/postgres
+postgresql://postgres:[PASSWORD]@database-1.xxxxx.ap-south-1.rds.amazonaws.com:5432/karnex_db
 ```
 
-`sslmode=require` is added automatically for cloud hosts. **Never commit this URL to GitHub.**
+`sslmode=require` is added automatically for RDS. **Never commit this URL to GitHub.**
+
+**RDS security group:** allow inbound **PostgreSQL (5432)** from Render. On the free tier, you may need `0.0.0.0/0` temporarily, or use a paid static outbound IP on Render.
 
 ## 3. Required Render environment variables
 
 | Variable | Value |
 |----------|--------|
-| `AUTH_DB_URL` | Your Supabase connection URI |
+| `AUTH_DB_URL` | Your RDS connection URI |
 | `OPENAI_API_KEY` or per-purpose keys | Your OpenAI keys |
 | `AUTH_SECRET` | Long random string (32+ chars) |
 | `REPORT_CODE` | Random secret |
@@ -57,4 +59,4 @@ API routes are proxied via `vercel.json` to your Render backend URL. Invite link
 
 - Render free tier sleeps after inactivity (~30–60s cold start).
 - SMTP is off by default; invite emails are skipped until you set `SMTP_ENABLED=true` and SMTP credentials.
-- Use Supabase **Session pooler** (port 5432), not Transaction pooler, for this app.
+- Use RDS in the same region as Render (e.g. `ap-south-1`) when possible for lower latency.

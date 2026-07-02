@@ -1,4 +1,4 @@
-# Render Blueprint — backend API only (Supabase Postgres external; no Render DB).
+# Render Blueprint — backend API only (external Postgres on AWS RDS; no Render DB).
 # Docs: docs/RENDER_DEPLOYMENT.md
 
 services:

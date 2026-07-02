@@ -28,7 +28,7 @@ def _client(purpose: str = "default"):
 
 def _db_target() -> str:
     """Resolve the active database target for prompt logging."""
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
+    direct = (os.getenv("AUTH_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
     if direct:
         return direct
     host = (os.getenv("DB_HOST") or "").strip()
@@ -443,6 +443,39 @@ def _normalize_professional_assessment_row(entry: dict) -> dict:
     if expected_answer and not out.get("ideal_answer"):
         out["ideal_answer"] = expected_answer
 
+    missed_raw = out.get("what_missed") or out.get("missed_points") or []
+    if isinstance(missed_raw, list):
+        out["what_missed"] = [str(x).strip()[:320] for x in missed_raw if str(x).strip()][:6]
+    elif isinstance(missed_raw, str) and missed_raw.strip():
+        out["what_missed"] = [missed_raw.strip()[:320]]
+
+    for list_key in (
+        "technical_mistakes",
+        "conceptual_mistakes",
+        "wrong_assumptions",
+        "interview_tips",
+        "recommended_study_topics",
+    ):
+        raw_list = out.get(list_key)
+        if isinstance(raw_list, list):
+            out[list_key] = [str(x).strip()[:400] for x in raw_list if str(x).strip()][:6]
+        elif isinstance(raw_list, str) and raw_list.strip():
+            out[list_key] = [raw_list.strip()[:400]]
+
+    how_to = str(out.get("how_to_improve") or "").strip()[:1200]
+    if how_to:
+        out["how_to_improve"] = how_to
+    elif improvement_areas:
+        out["how_to_improve"] = "; ".join(
+            str(item.get("correction") or item.get("explanation") or "").strip()
+            for item in improvement_areas
+            if isinstance(item, dict)
+        )[:1200]
+
+    candidate_summary = str(out.get("candidate_summary") or summary or "").strip()[:600]
+    if candidate_summary:
+        out["candidate_summary"] = candidate_summary
+
     if not interview_feedback:
         fb_parts = [summary, out.get("feedback", "")]
         out["interview_feedback"] = " ".join(str(p).strip() for p in fb_parts if str(p).strip())[:2200]
@@ -738,6 +771,14 @@ def scoring_rollup_counts(questions: List[str], answers: List[str]) -> dict:
         "generated_questions": int(generated),
         "attempted_questions": int(attempted),
         "evaluated_questions": int(evaluated),
+        "answered_questions": int(evaluated),
+        "skipped_questions": int(
+            sum(
+                1
+                for a in (ans[:generated] if generated else ans)
+                if str(a or "").strip().lower() in {"skip", "skipped", "[skipped]"}
+            )
+        ),
     }
 
 
@@ -1040,7 +1081,7 @@ def _role_hint_from_meta(meta: dict | None) -> str:
     return ""
 
 
-def _not_scored_per_question_row(question_index: int, weakness: str) -> dict:
+def _not_scored_per_question_row(question_index: int, weakness: str, *, excluded_from_score: bool = False) -> dict:
     """Fixed row for pool slots without a scorable answer (never sent to OpenAI)."""
     row = {
         "question_index": question_index,
@@ -1049,6 +1090,9 @@ def _not_scored_per_question_row(question_index: int, weakness: str) -> dict:
         "weaknesses": [weakness],
         "feedback": "Excluded from aggregate scoring: only attempted, scorable answers affect the final result.",
     }
+    if excluded_from_score or "introduction warmup" in weakness.lower():
+        row["excluded_from_score"] = True
+        row["excluded_reason"] = weakness
     row.update(_zero_score_professional_fields(feedback=row["feedback"], weaknesses=[weakness]))
     return _normalize_professional_assessment_row(row)
 
@@ -1181,6 +1225,7 @@ def evaluate_per_question_interview_batch(
             slots[i] = _not_scored_per_question_row(
                 i + 1,
                 "Introduction warmup (not counted toward overall score).",
+                excluded_from_score=True,
             )
             continue
         if answer_turn_is_valid_for_scoring(a):
@@ -1230,13 +1275,25 @@ def evaluate_per_question_interview_batch(
         return out
 
     chunk = _pq_chunk_size()
+    ref_map = {}
+    try:
+        from utils.canonical_expected_answers import (
+            expected_answer_for_question,
+            resolve_canonical_expected_answers_for_questions,
+        )
+
+        ref_map = resolve_canonical_expected_answers_for_questions(qs, meta, db_target=_db_target())
+    except Exception:
+        ref_map = {}
+        expected_answer_for_question = lambda _q, _m: ""  # type: ignore[assignment,misc]
     for s in range(0, len(to_score), chunk):
         block = to_score[s : s + chunk]
         cq = [t[1] for t in block]
         ca = [t[2] for t in block]
         idxs = [t[0] for t in block]
+        refs = [expected_answer_for_question(cq[j], ref_map) for j in range(len(cq))]
         part = _evaluate_per_question_chunk_openai_indexed(
-            cq, ca, idxs, model=model, role_hint=_role_hint_from_meta(meta)
+            cq, ca, idxs, model=model, role_hint=_role_hint_from_meta(meta), reference_answers=refs
         )
         if len(part) != len(block):
             for gi, q, a in block:
@@ -1255,6 +1312,12 @@ def evaluate_per_question_interview_batch(
         if isinstance(out[i], dict) and answer_turn_is_valid_for_scoring(ans[i]):
             out[i] = apply_quality_caps_to_per_question_row(out[i], qs[i], ans[i])
     _clamp_per_question_rows_to_substance(out, ans)
+    try:
+        from utils.canonical_expected_answers import apply_canonical_expected_answers
+
+        apply_canonical_expected_answers(out, qs, meta, db_target=_db_target())
+    except Exception:
+        pass
     return out
 
 
@@ -1265,19 +1328,29 @@ def _evaluate_per_question_chunk_openai_indexed(
     model: str,
     *,
     role_hint: str = "",
+    reference_answers: List[str] | None = None,
 ) -> List[dict]:
     """Score a chunk of answers; ``zero_based_indices[k]`` is the session index for qs[k]/ans[k]."""
     if len(qs) != len(ans) or len(qs) != len(zero_based_indices):
         return []
+    refs = list(reference_answers or [])
+    while len(refs) < len(qs):
+        refs.append("")
+    refs = refs[: len(qs)]
     turns = []
+    has_authoritative_refs = False
     for k in range(len(qs)):
-        turns.append(
-            {
-                "i": zero_based_indices[k] + 1,
-                "question": (qs[k] or "")[:900],
-                "answer": (ans[k] or "")[:2400],
-            }
-        )
+        ref = str(refs[k] or "").strip()
+        if ref:
+            has_authoritative_refs = True
+        turn = {
+            "i": zero_based_indices[k] + 1,
+            "question": (qs[k] or "")[:900],
+            "answer": (ans[k] or "")[:2400],
+        }
+        if ref:
+            turn["authoritative_reference_answer"] = ref[:3000]
+        turns.append(turn)
     role_ctx = (role_hint or "").strip()
     role_line = (
         f"Role context for expected answers and follow-ups: {role_ctx}.\n"
@@ -1299,17 +1372,37 @@ def _evaluate_per_question_chunk_openai_indexed(
         "If score is 0 or no real strengths, set correct_concepts to [] and strengths to "
         "[\"No significant technical strengths identified.\"].\n"
         "Step 8: Base interview_feedback strictly on what the candidate actually said (150-300 words).\n"
-        "Step 9: Write expected_answer independently as a 9-10/10 model answer for the role — "
-        "do NOT copy or paraphrase the candidate's answer.\n"
-        "Step 10: Provide 2-4 manager follow-up questions to probe gaps.\n"
+    )
+    if has_authoritative_refs:
+        user += (
+            "Step 9: When authoritative_reference_answer is provided for an item, score technical accuracy "
+            "against that reference (ISO 14229 / CAN-TP terminology where applicable). "
+            "Set expected_answer to the authoritative_reference_answer verbatim — do not invent a different reference.\n"
+            "Step 10: Provide 2-4 manager follow-up questions to probe gaps.\n"
+        )
+    else:
+        user += (
+            "Step 9: Write expected_answer independently as a 9-10/10 model answer for the role — "
+            "do NOT copy or paraphrase the candidate's answer. Use consistent automotive/CAN terminology.\n"
+            "Step 10: Provide 2-4 manager follow-up questions to probe gaps.\n"
+        )
+    user += (
         "Weighted score formula (0-10, one decimal allowed):\n"
         "  Question Relevance 30% + Technical Accuracy 30% + Completeness 20% + "
         "Practical Knowledge 10% + Communication 10%.\n"
         "Question repetition or keyword-only answers without explanation MUST score 0.\n"
         "Return ONLY JSON with this schema per item:\n"
         "{\"items\":[{\"i\":N,\"score\":0,\"overall_rating\":0,\"summary\":\"2-4 line evaluation summary\","
+        "\"candidate_summary\":\"2-4 line plain-language summary of what the candidate said\","
         "\"correct_concepts\":[{\"topic\":\"\",\"explanation\":\"\"}],"
+        "\"what_missed\":[\"concept or step the candidate did not cover\"],"
+        "\"technical_mistakes\":[\"specific technical error\"],"
+        "\"conceptual_mistakes\":[\"misunderstood concept\"],"
+        "\"wrong_assumptions\":[\"incorrect assumption stated\"],"
         "\"improvement_areas\":[{\"topic\":\"\",\"explanation\":\"\",\"correction\":\"\"}],"
+        "\"how_to_improve\":\"actionable coaching paragraph\","
+        "\"interview_tips\":[\"tip for future interviews\"],"
+        "\"recommended_study_topics\":[\"topic to study\"],"
         "\"expected_answer\":\"9-10/10 model answer\","
         "\"interview_feedback\":\"150-300 word hiring-manager feedback based on actual answer\","
         "\"follow_up_questions\":[\"\"],"
@@ -1327,7 +1420,7 @@ def _evaluate_per_question_chunk_openai_indexed(
                 "You produce rigorous hiring-manager interview assessments. Reply ONLY valid JSON. "
                 "Be strict: if the candidate repeats or copies the question without explaining, score 0. "
                 "Never fabricate correct_concepts — only credit what was actually stated. "
-                "expected_answer must be written independently as an expert model response. "
+                "When authoritative_reference_answer is supplied, expected_answer must match it exactly. "
                 "interview_feedback must reference the candidate's actual answer, not generic praise."
             ),
         },
@@ -1339,7 +1432,7 @@ def _evaluate_per_question_chunk_openai_indexed(
             model=model,
             response_format={"type": "json_object"},
             messages=msgs,
-            temperature=0.1,
+            temperature=0.0 if has_authoritative_refs else 0.1,
             call_type="evaluate_per_question_batch",
             db_target=_db_target(),
         )
@@ -1374,6 +1467,11 @@ def _evaluate_per_question_chunk_openai_indexed(
             if not row or "score" not in row:
                 dr = _deterministic_per_question_rows([qs[k]], [ans[k]], zero_based_indices[k])
                 row = dr[0]
+            ref = str(refs[k] or "").strip()
+            if ref:
+                row["expected_answer"] = ref
+                row["ideal_answer"] = ref
+                row["reference_answer_source"] = "question_bank"
             out.append(row)
         return out
     except Exception:
@@ -1386,27 +1484,538 @@ def _apply_question_bank_expected_answers(
     session_meta: dict | None,
 ) -> None:
     """Attach bank-authored expected answers to report rows when available."""
-    snap = (session_meta or {}).get("question_bank_snapshot")
-    if not isinstance(snap, dict) or not snap:
-        return
-    by_question: dict[str, str] = {}
-    for entry in snap.values():
-        if not isinstance(entry, dict):
-            continue
-        q = str(entry.get("question") or "").strip()
-        expected = str(entry.get("expected_answer") or "").strip()
-        if q and expected:
-            by_question[q] = expected
-    if not by_question:
-        return
-    for i, row in enumerate(rows):
+    from utils.canonical_expected_answers import apply_canonical_expected_answers
+
+    apply_canonical_expected_answers(rows, questions, session_meta, db_target=_db_target())
+
+
+_PROBLEM_SOLVING_Q_RE = re.compile(
+    r"\b("
+    r"scenario|troubleshoot|root cause|debug|diagnos|incident|outage|"
+    r"what would you|how would you handle|how do you handle|decision|"
+    r"trade-?off|optimize|bottleneck|failure|resolve|fix the"
+    r")\b",
+    re.IGNORECASE,
+)
+
+INTRO_RUBRIC_KEYS = (
+    "communication",
+    "confidence",
+    "clarity",
+    "grammar",
+    "professional_presentation",
+)
+
+
+def _is_problem_solving_question(question: str) -> bool:
+    return bool(_PROBLEM_SOLVING_Q_RE.search(str(question or "")))
+
+
+def _score_to_percent(value: object) -> int:
+    try:
+        v = float(value or 0.0)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v <= 10.0:
+        v *= 10.0
+    return int(max(0, min(100, round(v))))
+
+
+def _ten_scale_from_percent(percent: int) -> float:
+    return format_decimal_score(float(percent) / 10.0)
+
+
+def _deterministic_introduction_rubric(answer: str) -> dict:
+    text = " ".join(str(answer or "").split()).strip()
+    if not text:
+        return {
+            "communication": 0,
+            "confidence": 0,
+            "clarity": 0,
+            "grammar": 0,
+            "professional_presentation": 0,
+            "overall": 0,
+            "summary": "No introduction response was recorded.",
+            "feedback": "The candidate did not provide an introduction.",
+            "strengths": [],
+            "improvements": ["Provide a brief professional introduction."],
+        }
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    wc = len(words)
+    fillers = sum(1 for w in words if w in {"um", "uh", "like", "maybe", "sort", "kind"})
+    weak = any(p in text.lower() for p in ("i guess", "not sure", "probably"))
+    strong = any(p in text.lower() for p in ("i am", "i'm", "experienced", "background", "years"))
+    base = min(88, 38 + wc * 2)
+    grammar = max(0, min(100, base - fillers * 6))
+    clarity = max(0, min(100, base - (8 if wc < 12 else 0)))
+    confidence = max(0, min(100, base + (10 if strong else 0) - (18 if weak else 0) - fillers * 5))
+    communication = max(0, min(100, round((grammar + clarity) / 2)))
+    professional = max(0, min(100, base + (6 if "." in text else 0)))
+    overall = int(round((communication + confidence + clarity + grammar + professional) / 5))
+    summary = (
+        "Clear professional introduction with structured self-summary."
+        if overall >= 70
+        else "Introduction provided but could be more structured and confident."
+        if overall >= 45
+        else "Introduction needs clearer structure, grammar, and professional tone."
+    )
+    return {
+        "communication": communication,
+        "confidence": confidence,
+        "clarity": clarity,
+        "grammar": grammar,
+        "professional_presentation": professional,
+        "overall": overall,
+        "summary": summary,
+        "feedback": summary,
+        "strengths": ["Provided an introduction response."] if wc >= 8 else [],
+        "improvements": ["Expand the introduction with role-relevant highlights."] if overall < 70 else [],
+    }
+
+
+def evaluate_introduction_answer(
+    question: str,
+    answer: str,
+    model: str = "gpt-4o-mini",
+) -> dict:
+    """Score the warmup introduction on communication rubric dimensions (0–100 each)."""
+    try:
+        from utils.warmup import WARMUP_QUESTION_TEXT as _WARMUP_Q
+    except ImportError:
+        _WARMUP_Q = "Please introduce yourself."
+    q = str(question or _WARMUP_Q).strip() or _WARMUP_Q
+    a = " ".join(str(answer or "").split()).strip()
+    if not a:
+        out = _deterministic_introduction_rubric("")
+        out["question"] = q
+        out["answer"] = ""
+        out["excluded_from_technical_score"] = True
+        return out
+
+    prompt = f"""
+You evaluate ONLY the candidate's self-introduction (not technical knowledge).
+
+Score each dimension from 0 to 100 (integer):
+- communication: grammar, sentence structure, fluency, completeness
+- confidence: certainty, directness, minimal hesitation/filler language
+- clarity: easy to follow, organized thoughts
+- grammar: grammatical correctness and professional language
+- professional_presentation: polite, interview-appropriate tone and structure
+
+Rules:
+- This intro must NOT assess technical accuracy.
+- Return STRICT JSON only.
+
+{{
+  "communication": 0,
+  "confidence": 0,
+  "clarity": 0,
+  "grammar": 0,
+  "professional_presentation": 0,
+  "overall": 0,
+  "summary": "One sentence summary.",
+  "feedback": "Two sentence actionable feedback.",
+  "strengths": ["..."],
+  "improvements": ["..."]
+}}
+
+Question: {q}
+Answer: {a}
+"""
+    data = _deterministic_introduction_rubric(a)
+    try:
+        from openai_client import openai_key_configured
+
+        if openai_key_configured("eval"):
+            res = tracked_chat_completion(
+                _client("eval"),
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                call_type="evaluate_introduction",
+                db_target=_db_target(),
+            )
+            content = (res.choices[0].message.content or "").strip()
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                cleaned = content.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                for key in INTRO_RUBRIC_KEYS:
+                    if key in parsed:
+                        data[key] = _score_to_percent(parsed.get(key))
+                if parsed.get("overall") is not None:
+                    data["overall"] = _score_to_percent(parsed.get("overall"))
+                data["summary"] = str(parsed.get("summary") or data.get("summary") or "").strip() or data["summary"]
+                data["feedback"] = str(parsed.get("feedback") or data.get("feedback") or data["summary"]).strip()
+                if isinstance(parsed.get("strengths"), list):
+                    data["strengths"] = [str(x).strip() for x in parsed["strengths"] if str(x).strip()][:6]
+                if isinstance(parsed.get("improvements"), list):
+                    data["improvements"] = [str(x).strip() for x in parsed["improvements"] if str(x).strip()][:6]
+    except Exception:
+        pass
+
+    data["question"] = q
+    data["answer"] = a
+    data["excluded_from_technical_score"] = True
+    if not data.get("overall"):
+        data["overall"] = int(
+            round(
+                sum(int(data.get(k) or 0) for k in INTRO_RUBRIC_KEYS) / max(1, len(INTRO_RUBRIC_KEYS))
+            )
+        )
+    return data
+
+
+def _avg_percent_from_rows(rows: list, *keys: str) -> int:
+    vals: list[float] = []
+    for row in rows or []:
         if not isinstance(row, dict):
             continue
-        q = str((questions[i] if i < len(questions) else "") or "").strip()
-        expected = by_question.get(q)
-        if expected:
-            row["expected_answer"] = expected
-            row["ideal_answer"] = expected
+        dims = row.get("dimension_scores") if isinstance(row.get("dimension_scores"), dict) else row
+        for key in keys:
+            try:
+                v = float((dims or {}).get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v <= 10.0:
+                v *= 10.0
+            if v > 0:
+                vals.append(v)
+    if not vals:
+        return 0
+    return int(max(0, min(100, round(sum(vals) / len(vals)))))
+
+
+def _criteria_reason_from_breakdown(label: str, criteria: dict) -> str:
+    if not isinstance(criteria, dict) or not criteria:
+        return f"{label} assessed from interview responses."
+    parts: list[str] = []
+    for key, val in criteria.items():
+        try:
+            score = int(val)
+        except (TypeError, ValueError):
+            continue
+        parts.append(f"{str(key).replace('_', ' ')} {score}%")
+    return f"{label}: " + "; ".join(parts[:6]) + "." if parts else f"{label} assessed from interview responses."
+
+
+def _build_enterprise_criteria_breakdown(
+    *,
+    comm_eval: dict,
+    intro_eval: dict,
+    rows: list,
+    questions: list,
+    answers: list,
+    rollup: dict | None,
+) -> tuple[dict, str]:
+    comm_crit = (
+        comm_eval.get("criteria_breakdown", {}).get("communication")
+        if isinstance(comm_eval.get("criteria_breakdown"), dict)
+        else {}
+    )
+    conf_crit = (
+        comm_eval.get("criteria_breakdown", {}).get("confidence")
+        if isinstance(comm_eval.get("criteria_breakdown"), dict)
+        else {}
+    )
+    if not comm_crit and intro_eval:
+        comm_crit = {
+            "grammar": _score_to_percent(intro_eval.get("grammar")),
+            "fluency": _score_to_percent(intro_eval.get("communication")),
+            "vocabulary": _score_to_percent(intro_eval.get("clarity")),
+            "clarity": _score_to_percent(intro_eval.get("clarity")),
+            "organization": _score_to_percent(intro_eval.get("professional_presentation")),
+            "professional_language": _score_to_percent(intro_eval.get("professional_presentation")),
+        }
+    if not conf_crit and intro_eval:
+        conf_crit = {
+            "hesitation": max(0, 100 - _score_to_percent(intro_eval.get("confidence"))),
+            "pauses": max(0, 100 - _score_to_percent(intro_eval.get("confidence"))),
+            "filler_words": max(0, 100 - _score_to_percent(intro_eval.get("confidence"))),
+            "certainty": _score_to_percent(intro_eval.get("confidence")),
+            "flow": _score_to_percent(intro_eval.get("communication")),
+        }
+
+    tech = {
+        "concepts": _avg_percent_from_rows(rows, "concept_coverage"),
+        "terminology": _avg_percent_from_rows(rows, "technical_accuracy"),
+        "accuracy": _avg_percent_from_rows(rows, "technical_accuracy"),
+        "depth": _avg_percent_from_rows(rows, "depth"),
+        "examples": _avg_percent_from_rows(rows, "depth", "concept_coverage"),
+        "completeness": _avg_percent_from_rows(rows, "concept_coverage", "depth"),
+    }
+    ps_rows = [
+        (rows[i] if i < len(rows) else {})
+        for i, q in enumerate(questions or [])
+        if _is_problem_solving_question(str(q or ""))
+    ]
+    ps_source = ps_rows if ps_rows else rows
+    problem_solving = {
+        "logical_thinking": _avg_percent_from_rows(ps_source, "technical_accuracy", "concept_coverage"),
+        "step_by_step": _avg_percent_from_rows(ps_source, "depth"),
+        "root_cause": _avg_percent_from_rows(ps_source, "technical_accuracy"),
+        "decisions": _avg_percent_from_rows(ps_source, "concept_coverage"),
+        "trade_offs": _avg_percent_from_rows(ps_source, "depth", "technical_accuracy"),
+    }
+    roll = rollup if isinstance(rollup, dict) else scoring_rollup_counts(questions, answers)
+    completion = {
+        "attempted": int(roll.get("attempted_questions") or 0),
+        "answered": int(roll.get("answered_questions") or roll.get("evaluated_questions") or 0),
+        "skipped": int(roll.get("skipped_questions") or 0),
+        "generated": int(roll.get("generated_questions") or 0),
+    }
+    breakdown = {
+        "communication": comm_crit if isinstance(comm_crit, dict) else {},
+        "confidence": conf_crit if isinstance(conf_crit, dict) else {},
+        "technical": tech,
+        "problem_solving": problem_solving,
+        "completion": completion,
+    }
+    rationale = str(comm_eval.get("scoring_rationale") or "").strip()
+    if not rationale:
+        rationale = (
+            f"Technical {tech.get('accuracy', 0)}% from per-question accuracy; "
+            f"communication {_criteria_reason_from_breakdown('communication', breakdown['communication'])} "
+            f"Confidence {_criteria_reason_from_breakdown('confidence', breakdown['confidence'])} "
+            f"Completion: {completion.get('answered', 0)} answered / {completion.get('attempted', 0)} attempted "
+            f"({completion.get('skipped', 0)} skipped)."
+        )
+    return breakdown, rationale[:1200]
+
+
+def apply_interview_score_model(
+    out: dict,
+    questions: List[str],
+    answers: List[str],
+    *,
+    session_meta: dict | None = None,
+) -> dict:
+    """
+    Final weighted score model (Jun 2026):
+      Overall = Technical 50% + Communication 20% + Confidence 15% + Problem Solving 15%
+    All category scores stored as 0–10 internally and 0–100 in score_reasons.
+    """
+    result = dict(out) if isinstance(out, dict) else {}
+    rows = list(result.get("per_question") or result.get("question_evaluations") or [])
+    qs = list(questions or [])
+    ans = list(answers or [])
+    n = max(len(rows), len(qs), len(ans))
+    while len(ans) < n:
+        ans.append("")
+    while len(qs) < n:
+        qs.append("")
+    qs = qs[:n]
+    ans = ans[:n]
+
+    try:
+        from utils.warmup import WARMUP_QUESTION_TEXT, is_scoring_excluded_index
+    except ImportError:
+        WARMUP_QUESTION_TEXT = ""
+        is_scoring_excluded_index = lambda _m, _i: False  # type: ignore[assignment,misc]
+    try:
+        from utils.score_exclusion import is_row_excluded_from_score
+    except ImportError:
+        is_row_excluded_from_score = lambda _r: False  # type: ignore[assignment,misc]
+
+    tech_scores: list[float] = []
+    ps_scores: list[float] = []
+    for i in range(n):
+        q_text = (qs[i] or "").strip()
+        if is_scoring_excluded_index(session_meta, i) or (WARMUP_QUESTION_TEXT and q_text == WARMUP_QUESTION_TEXT):
+            continue
+        if not answer_turn_is_valid_for_scoring(ans[i]):
+            continue
+        row = rows[i] if i < len(rows) else {}
+        if is_row_excluded_from_score(row):
+            continue
+        try:
+            sc = float((row or {}).get("score") or 0.0)
+        except (TypeError, ValueError):
+            sc = 0.0
+        pct = sc * 10.0 if sc <= 10.0 else sc
+        tech_scores.append(pct)
+        if _is_problem_solving_question(q_text):
+            ps_scores.append(pct)
+
+    tech_pct = int(round(sum(tech_scores) / len(tech_scores))) if tech_scores else 0
+    ps_pct = int(round(sum(ps_scores) / len(ps_scores))) if ps_scores else tech_pct
+
+    comm_eval = result.get("communication_evaluation") if isinstance(result.get("communication_evaluation"), dict) else {}
+    intro_eval = result.get("introduction_evaluation") if isinstance(result.get("introduction_evaluation"), dict) else {}
+
+    comm_base = _score_to_percent(comm_eval.get("communication_score") or comm_eval.get("overall_score"))
+    conf_base = _score_to_percent(
+        comm_eval.get("presentation_score") or comm_eval.get("confidence_score") or comm_eval.get("overall_score")
+    )
+    intro_comm = _score_to_percent(intro_eval.get("communication") or intro_eval.get("overall"))
+    intro_conf = _score_to_percent(intro_eval.get("confidence") or intro_eval.get("overall"))
+    intro_clarity = _score_to_percent(intro_eval.get("clarity"))
+    intro_grammar = _score_to_percent(intro_eval.get("grammar"))
+    intro_prof = _score_to_percent(intro_eval.get("professional_presentation"))
+
+    if intro_eval:
+        comm_pct = int(round(0.65 * comm_base + 0.35 * intro_comm)) if comm_base else intro_comm
+        conf_pct = int(round(0.55 * conf_base + 0.45 * intro_conf)) if conf_base else intro_conf
+    else:
+        comm_pct = comm_base
+        conf_pct = conf_base
+
+    # When technical answers were evaluated, headline overall must track their mean.
+    # Soft-skill dimensions stay visible in score_reasons but must not inflate a
+    # failed technical interview (e.g. 10%/0%/0% answers → ~3% overall, not ~21%).
+    if tech_scores:
+        overall_pct = tech_pct
+        overall_reason = (
+            f"Mean of {len(tech_scores)} evaluated answer(s); "
+            "communication and confidence shown separately and do not inflate this score."
+        )
+        if tech_pct < 40:
+            comm_pct = min(comm_pct, max(tech_pct + 10, comm_pct // 2))
+            conf_pct = min(conf_pct, max(tech_pct + 10, conf_pct // 2))
+            ps_pct = min(ps_pct, max(tech_pct, ps_pct))
+    else:
+        # Guard: if no valid technical answers exist, do not let the introduction
+        # evaluation alone inflate the headline score. intro_eval contributes to
+        # comm_pct / conf_pct even when the candidate said nothing for actual
+        # interview questions, which can produce a spuriously high overall (e.g.
+        # intro scores 78% → overall reported as 78% despite evaluated_count = 0).
+        has_valid_ans = any(answer_turn_is_valid_for_scoring(a) for a in ans)
+        if has_valid_ans:
+            overall_pct = int(round(0.55 * comm_pct + 0.45 * conf_pct))
+            overall_reason = "No evaluable technical answers; overall based on communication and confidence."
+        else:
+            overall_pct = 0
+            overall_reason = "No evaluable answers recorded; overall score is 0."
+
+    tech_reason = (
+        f"Based on {len(tech_scores)} technical answer(s); average relevance and accuracy."
+        if tech_scores
+        else "No evaluable technical answers were recorded."
+    )
+    ps_reason = (
+        f"Scenario / troubleshooting answers averaged across {len(ps_scores)} question(s)."
+        if ps_scores
+        else "No dedicated scenario questions; aligned with technical performance."
+    )
+    comm_reason = str(
+        comm_eval.get("summary")
+        or intro_eval.get("summary")
+        or intro_eval.get("feedback")
+        or "Communication assessed across interview responses."
+    ).strip()
+    conf_reason = str(
+        intro_eval.get("feedback")
+        or comm_eval.get("summary")
+        or "Confidence inferred from directness and filler language."
+    ).strip()
+
+    result["technical_score"] = _ten_scale_from_percent(tech_pct)
+    result["communication_score"] = _ten_scale_from_percent(comm_pct)
+    result["confidence_score"] = _ten_scale_from_percent(conf_pct)
+    result["problem_solving_score"] = _ten_scale_from_percent(ps_pct)
+    result["overall_score"] = _ten_scale_from_percent(overall_pct)
+    result["overall_score_percent"] = float(overall_pct)
+
+    result["score_reasons"] = {
+        "communication": {"score": comm_pct, "reason": comm_reason},
+        "technical": {"score": tech_pct, "reason": tech_reason},
+        "confidence": {"score": conf_pct, "reason": conf_reason},
+        "problem_solving": {"score": ps_pct, "reason": ps_reason},
+        "overall": {
+            "score": overall_pct,
+            "reason": overall_reason,
+        },
+    }
+
+    ss = dict(result.get("scoring_summary") or {}) if isinstance(result.get("scoring_summary"), dict) else {}
+    ss.update(
+        {
+            "mean_score_on_evaluated": _ten_scale_from_percent(tech_pct if tech_scores else overall_pct),
+            "overall_score_percent": float(overall_pct),
+            "technical_score_percent": float(tech_pct),
+            "communication_score_percent": float(comm_pct),
+            "confidence_score_percent": float(conf_pct),
+            "problem_solving_score_percent": float(ps_pct),
+            "score_model": "technical_mean_v1_jun2026",
+            "weights": {
+                "technical": 1.0 if tech_scores else 0.0,
+                "communication": 0.0 if tech_scores else 0.55,
+                "confidence": 0.0 if tech_scores else 0.45,
+                "problem_solving": 0.0,
+            },
+        }
+    )
+    if intro_eval:
+        ss["introduction_rubric"] = {
+            k: _score_to_percent(intro_eval.get(k))
+            for k in (*INTRO_RUBRIC_KEYS, "overall")
+            if intro_eval.get(k) is not None
+        }
+        if intro_clarity:
+            ss["introduction_rubric"]["clarity"] = intro_clarity
+        if intro_grammar:
+            ss["introduction_rubric"]["grammar"] = intro_grammar
+        if intro_prof:
+            ss["introduction_rubric"]["professional_presentation"] = intro_prof
+    result["scoring_summary"] = ss
+
+    if overall_pct <= 10:
+        result["recommendation"] = "Reject"
+        result["overall_fitment"] = "Weak Fit"
+    elif overall_pct <= 35:
+        result["recommendation"] = "Reject"
+        result["overall_fitment"] = "Weak Fit"
+    elif overall_pct <= 55:
+        if str(result.get("recommendation") or "").strip().lower() == "hire":
+            result["recommendation"] = "Consider"
+        result["overall_fitment"] = result.get("overall_fitment") or "Moderate Fit"
+    elif overall_pct <= 75:
+        result["recommendation"] = result.get("recommendation") or "Consider"
+        result["overall_fitment"] = result.get("overall_fitment") or "Good Fit"
+    else:
+        result["recommendation"] = result.get("recommendation") or "Hire"
+        result["overall_fitment"] = result.get("overall_fitment") or "Strong Fit"
+
+    breakdown, rationale = _build_enterprise_criteria_breakdown(
+        comm_eval=comm_eval,
+        intro_eval=intro_eval,
+        rows=rows,
+        questions=qs,
+        answers=ans,
+        rollup=result.get("scoring_summary") if isinstance(result.get("scoring_summary"), dict) else None,
+    )
+    result["criteria_breakdown"] = breakdown
+    result["scoring_rationale"] = rationale
+    if isinstance(breakdown.get("communication"), dict) and breakdown["communication"]:
+        result["score_reasons"]["communication"]["reason"] = _criteria_reason_from_breakdown(
+            "Communication",
+            breakdown["communication"],
+        )
+    if isinstance(breakdown.get("confidence"), dict) and breakdown["confidence"]:
+        result["score_reasons"]["confidence"]["reason"] = _criteria_reason_from_breakdown(
+            "Confidence",
+            breakdown["confidence"],
+        )
+    if isinstance(breakdown.get("technical"), dict) and breakdown["technical"]:
+        result["score_reasons"]["technical"]["reason"] = _criteria_reason_from_breakdown(
+            "Technical",
+            breakdown["technical"],
+        )
+    if isinstance(breakdown.get("problem_solving"), dict) and breakdown["problem_solving"]:
+        result["score_reasons"]["problem_solving"]["reason"] = _criteria_reason_from_breakdown(
+            "Problem solving",
+            breakdown["problem_solving"],
+        )
+    completion = breakdown.get("completion") if isinstance(breakdown.get("completion"), dict) else {}
+    if completion:
+        result["score_reasons"]["overall"]["reason"] = (
+            f"{overall_reason} "
+            f"Completion: {completion.get('answered', 0)} answered, "
+            f"{completion.get('attempted', 0)} attempted, {completion.get('skipped', 0)} skipped."
+        ).strip()
+
+    return result
 
 
 def merge_per_question_eval_into_report(
@@ -1426,7 +2035,17 @@ def merge_per_question_eval_into_report(
     Unattempted pool questions are ignored in the denominator; per-question rows for
     the full session are unchanged for display.
     """
-    rows = evaluate_per_question_interview_batch(questions, answers, model=model, meta=session_meta)
+    try:
+        from utils.warmup import meta_for_filtered_qa_evaluation
+    except ImportError:
+        meta_for_filtered_qa_evaluation = lambda m, _q: m  # type: ignore[assignment,misc]
+
+    rows = evaluate_per_question_interview_batch(
+        questions,
+        answers,
+        model=model,
+        meta=meta_for_filtered_qa_evaluation(session_meta, questions),
+    )
     out = dict(result) if isinstance(result, dict) else {}
     n = len(rows)
     if n == 0:
@@ -1454,11 +2073,12 @@ def merge_per_question_eval_into_report(
         is_row_excluded_from_score = lambda _r: False  # type: ignore[assignment,misc]
 
     valid_idx = []
+    eval_meta = meta_for_filtered_qa_evaluation(session_meta, questions)
     for i in range(n):
         if not answer_turn_is_valid_for_scoring(ans_aligned[i]):
             continue
         q_text = (qs_aligned[i] or "").strip()
-        if is_scoring_excluded_index(session_meta, i) or (WARMUP_QUESTION_TEXT and q_text == WARMUP_QUESTION_TEXT):
+        if is_scoring_excluded_index(eval_meta, i) or (WARMUP_QUESTION_TEXT and q_text == WARMUP_QUESTION_TEXT):
             continue
         if is_row_excluded_from_score(rows[i] if i < len(rows) else None):
             continue
@@ -1487,20 +2107,18 @@ def merge_per_question_eval_into_report(
         "overall_score_percent": format_percent_from_ten_scale(mean_evaluated),
         "policy": "final_aggregates_use_answered_evaluated_turns_only",
     }
-    out["technical_score"] = mean_evaluated
-    out["problem_solving_score"] = mean_evaluated
+
+    out = apply_interview_score_model(out, qs_aligned, ans_aligned, session_meta=eval_meta)
 
     try:
         mo = float(out.get("overall_score") or 0.0)
     except (TypeError, ValueError):
         mo = 0.0
     out["skill_model_overall_score"] = format_decimal_score(mo)
-    out["overall_score"] = mean_evaluated
-    out["overall_score_percent"] = format_percent_from_ten_scale(mean_evaluated)
 
-    mt = float(mean_evaluated)
     ss = out.get("skill_scores")
     if isinstance(ss, list):
+        mt = float(out.get("technical_score") or mean_evaluated)
         for row in ss:
             if not isinstance(row, dict):
                 continue
@@ -1509,18 +2127,6 @@ def merge_per_question_eval_into_report(
             except (TypeError, ValueError):
                 sc = 0.0
             row["score"] = format_decimal_score(min(sc, mt))
-
-    os_final = float(out.get("overall_score") or 0.0)
-    if os_final <= 1.0:
-        out["recommendation"] = "Reject"
-        out["overall_fitment"] = "Weak Fit"
-    elif os_final <= 3.5:
-        out["recommendation"] = "Reject"
-        out["overall_fitment"] = "Weak Fit"
-    elif os_final <= 5.5:
-        if str(out.get("recommendation") or "").strip().lower() == "hire":
-            out["recommendation"] = "Consider"
-        out["overall_fitment"] = out.get("overall_fitment") or "Moderate Fit"
 
     out["per_question_eval_mode"] = "openai" if (os.getenv("OPENAI_API_KEY") or "").strip() not in (
         "",
@@ -3290,7 +3896,11 @@ def evaluate_communication_skills(
     prompt = f"""
 You are an HR evaluator analyzing a candidate's communication and presentation skills based on their interview responses.
 
-Evaluate based on the following criteria:
+Evaluate based on the following criteria (each 0-100 in criteria_breakdown):
+Communication — grammar, fluency, vocabulary, clarity, organization, professional_language
+Confidence — hesitation, pauses, filler_words, certainty, flow
+
+Also provide headline scores:
 1. Communication Skills (Score: 0-10): Clarity of explanation, sentence structure, coherence, ability to convey ideas.
 2. Presentation Skills (Score: 0-10): Logical flow, confidence in explanation, structure (intro -> explanation -> conclusion).
 3. Grammar & Language Quality: Detect grammatical errors and ensure final feedback is fully grammatically correct. Do NOT output incorrect grammar.
@@ -3317,7 +3927,25 @@ Output Format:
   "improvements": [
     "Point 1",
     "Point 2"
-  ]
+  ],
+  "criteria_breakdown": {{
+    "communication": {{
+      "grammar": 0,
+      "fluency": 0,
+      "vocabulary": 0,
+      "clarity": 0,
+      "organization": 0,
+      "professional_language": 0
+    }},
+    "confidence": {{
+      "hesitation": 0,
+      "pauses": 0,
+      "filler_words": 0,
+      "certainty": 0,
+      "flow": 0
+    }}
+  }},
+  "scoring_rationale": "One paragraph explaining how criteria_breakdown maps to the headline scores."
 }}
 
 Interview Questions:

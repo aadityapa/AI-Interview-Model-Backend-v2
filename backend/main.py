@@ -62,8 +62,10 @@ from ai import (
     synthesize_speech_bytes,
     transcribe_speech_bytes,
     evaluate_communication_skills,
+    evaluate_introduction_answer,
 )
-from session import sessions, session_lock
+from session import proctor_sessions, redis_available, release_session_lock, session_backend, sessions, session_lock
+from jobs import enqueue_bulk_rescore, enqueue_report_upgrade, job_backend, start_job_worker
 from learning import (
     backfill_learning_from_records,
     append_from_evaluation,
@@ -99,7 +101,6 @@ from auth_db import (
     delete_interview_record,
     delete_interview_schedule,
     delete_interview_schedule_by_token,
-    get_database_snapshot,
     get_interview_record_payload,
     get_interview_progress_by_invite,
     get_hr_candidate_decision,
@@ -110,9 +111,14 @@ from auth_db import (
     list_hr_candidate_decisions,
     recent_questions_for_job_template,
     list_interview_records_for_candidate,
+    list_recent_interview_records,
+    list_recent_interview_summaries,
+    count_interview_records,
+    get_job_template_summaries_batch,
     list_interview_schedules,
     list_interview_integrity_logs,
     list_job_templates,
+    list_job_templates_summary,
     get_job_template,
     search_candidate_suggestions,
     search_master_values,
@@ -133,6 +139,7 @@ from auth_db import (
 from hr.repository import (
     delete_record_by_id,
     delete_records_for_candidate,
+    interview_record_key,
     list_records_for_candidate,
     load_hr_records,
     upsert_hr_record,
@@ -168,9 +175,17 @@ from utils.speech_validation import (
     skip_allowed_by_speech_evidence,
     skip_should_convert_to_answer,
 )
+from utils.invite_session_guard import (
+    expected_question_source,
+    invite_session_matches_template,
+    invite_session_playable,
+    invite_session_safe_to_rebuild,
+    is_locked_question_source,
+)
 from utils.time_warnings import AUDIT_FIELD_BY_KEY, stamp_time_warning_settings
 from utils.strengths_weaknesses_analysis import attach_strengths_weaknesses_analysis
 from utils.warmup import (
+    extract_warmup_qa,
     filter_out_warmups,
     inject_warmup,
     is_warmup_index,
@@ -226,17 +241,74 @@ def _migrate_job_configs_to_db_if_needed() -> int:
     return imported
 
 
-def load_env() -> None:
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+def _parse_env_file(env_path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not env_path.is_file():
+        return out
+    for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            out[key] = value
+    return out
+
+
+def load_env() -> None:
+    """Load project .env from backend parent directory only (portable across machines).
+
+    Use the non-resolved package root so a drive letter junction (e.g. E: -> D:)
+    does not silently load a different .env than the tree the user is editing.
+    """
+    backend_root = Path(__file__).parent.parent
+    parsed: dict[str, str] = _parse_env_file(backend_root / ".env")
+
+    if not parsed:
+        return
+
+    db_keys = frozenset(
+        {"AUTH_DB_URL", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "USE_LOCAL_DB"}
+    )
+    # Always prefer project .env for access-control keys (avoid stale OS overrides).
+    force_from_file = frozenset(
+        {
+            "SUPER_ADMIN_EMAILS",
+            "SUPER_ADMIN_USERNAMES",
+            "USE_LOCAL_DB",
+            "ALLOW_PUBLIC_HR_REGISTRATION",
+            "FRONTEND_DIR",
+            "PUBLIC_BASE_URL",
+        }
+    )
+    use_local_flag = str(parsed.get("USE_LOCAL_DB") or "").strip().lower() in {"1", "true", "yes", "on"}
+    local_pg_in_file = bool(
+        parsed.get("DB_HOST") and parsed.get("DB_NAME") and parsed.get("DB_USER")
+    )
+    auth_url_in_file = bool(str(parsed.get("AUTH_DB_URL") or "").strip())
+
+    for key, value in parsed.items():
+        if key in db_keys:
+            continue
+        if key in force_from_file:
+            os.environ[key] = value
+        else:
+            os.environ.setdefault(key, value)
+
+    # When .env defines local Postgres, use it and drop stale OS-level AUTH_DB_URL (e.g. Supabase).
+    if use_local_flag or (local_pg_in_file and not auth_url_in_file):
+        os.environ.pop("AUTH_DB_URL", None)
+        for k in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "USE_LOCAL_DB"):
+            if k in parsed:
+                os.environ[k] = parsed[k]
+    else:
+        if auth_url_in_file:
+            os.environ["AUTH_DB_URL"] = parsed["AUTH_DB_URL"]
+        for k in db_keys:
+            if k in parsed and k != "USE_LOCAL_DB":
+                os.environ.setdefault(k, parsed[k])
 
 
 load_env()
@@ -321,8 +393,20 @@ def _generate_interview_questions(
     template_prompt: str = "",
     template_custom: bool = False,
     validation_skills: list | None = None,
+    question_context: str = "",
 ) -> list[str]:
     """Mode-aware question generation with OpenAI + fallback."""
+    logger.info(
+        "openai.question_generation",
+        extra={
+            "event": "openai.question_generation",
+            "openai_generation_called": "YES",
+            "question_context": str(question_context or "unspecified"),
+            "count": int(n or 0),
+            "interview_mode": str(interview_mode or ""),
+            "role": str(role or "")[:120],
+        },
+    )
     merged_hints = sanitize_prompt_input(template_prompt, max_chars=8000).strip()
     if not merged_hints:
         merged_hints = (coach_hints or "").strip()
@@ -408,6 +492,128 @@ def _build_question_avoid_history(
     )
 
 
+def _resolve_canonical_expected_answers(
+    questions: list,
+    session_meta: dict | None = None,
+    *,
+    db_target=None,
+) -> dict[str, str]:
+    """Resolve canonical expected answers; never crash bootstrap on import issues."""
+    try:
+        from utils.canonical_expected_answers import resolve_canonical_expected_answers_for_questions
+
+        return resolve_canonical_expected_answers_for_questions(
+            questions, session_meta or {}, db_target=db_target or AUTH_DB_TARGET
+        )
+    except Exception:
+        logger.warning(
+            "canonical_expected_answers unavailable; using empty map",
+            exc_info=True,
+            extra={"event": "canonical_expected_answers.fallback"},
+        )
+        return {}
+
+
+def _questions_from_question_bank(
+    *,
+    job: dict | None,
+    weights: dict | None,
+    pool_q: int,
+    question_seed: str,
+    invite_token: str = "",
+    candidate_name: str = "",
+) -> tuple[list[str], dict, dict[str, str], dict]:
+    """Select interview questions from the approved Question Bank (no AI generation)."""
+    from services.question_bank.selection import parse_question_bank_config, select_question_bank_for_interview
+
+    w = weights if isinstance(weights, dict) else {}
+    cfg = parse_question_bank_config(w)
+    avoid_hist = _build_question_avoid_history(job, w, include_template_preview=False)
+    avoid_texts = avoid_hist if cfg.get("avoidDuplicateQuestions") else None
+    result = select_question_bank_for_interview(
+        AUTH_DB_TARGET,
+        weights=w,
+        job=job,
+        num_q=pool_q,
+        seed=question_seed,
+        avoid_question_texts=avoid_texts,
+        allow_partial=True,
+        use_preview_fallback=False,
+    )
+    questions = list(result.get("questions") or [])
+    snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+    validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
+    qb_meta = {
+        "validation": validation,
+        "relaxation_mode": str(result.get("relaxation_mode") or ""),
+        "partial_pool": bool(result.get("partial_pool")),
+        "questions_found": int(result.get("questions_found") or 0),
+        "questions_selected": int(result.get("questions_selected") or 0),
+    }
+    logger.info(
+        "question_bank.bootstrap",
+        extra={
+            "event": "question_bank.bootstrap",
+            "template_id": str((job or {}).get("jobId") or ""),
+            "job_id": str((job or {}).get("jobId") or ""),
+            "role": str(validation.get("role", {}).get("filter") or (job or {}).get("jobTitle") or ""),
+            "skills": [s.get("skill") for s in (validation.get("skills") or []) if isinstance(s, dict)][:8],
+            "difficulty": str(validation.get("difficulty", {}).get("filter") or ""),
+            "category": str(validation.get("category", {}).get("filter") or ""),
+            "questions_found": qb_meta["questions_found"],
+            "questions_selected": qb_meta["questions_selected"],
+            "question_source": "question_bank",
+            "openai_generation_called": "NO",
+            "relaxation_mode": qb_meta["relaxation_mode"],
+            "partial_pool": qb_meta["partial_pool"],
+            "candidate_name": str(candidate_name or ""),
+            "invite_token": _invite_token_tag(invite_token) if invite_token else "",
+            # Verification: log the actual question IDs selected so HR can confirm
+            # they match the Question Bank Preview shown in the template editor.
+            "selected_question_ids": [
+                str((snapshot.get(str(i)) or {}).get("question_id") or "")
+                for i in range(len(questions))
+            ][:10],
+        },
+    )
+    canonical: dict[str, str] = {}
+    for i, qtext in enumerate(questions):
+        snap = snapshot.get(str(i)) if isinstance(snapshot, dict) else None
+        expected = str((snap or {}).get("expected_answer") or "").strip()
+        if expected:
+            canonical[str(i)] = expected
+    if not canonical:
+        canonical = _resolve_canonical_expected_answers(questions, {})
+    return questions, snapshot, canonical, qb_meta
+
+
+def _question_bank_empty_bootstrap_response(qb_meta: dict | None) -> dict:
+    from services.question_bank.selection import format_question_bank_validation_error
+
+    validation = (qb_meta or {}).get("validation") if isinstance((qb_meta or {}).get("validation"), dict) else {}
+    return {
+        "error": format_question_bank_validation_error(validation or {}),
+        "validation": validation or {},
+    }
+
+
+def _finalize_bootstrap_question_list(
+    questions: list,
+    *,
+    locked_source: bool,
+    question_seed: str,
+    pool_q: int,
+) -> list[str]:
+    """Preserve manual / Question Bank text; dedupe+shuffle only for dynamic AI pools."""
+    cleaned = [" ".join(str(q or "").strip().split()) for q in (questions or []) if str(q or "").strip()]
+    if locked_source:
+        return cleaned[:pool_q]
+    from utils.question_uniqueness import dedupe_question_list_semantic
+
+    qs = prepare_unique_question_sequence(cleaned, seed=question_seed, limit=pool_q)
+    return dedupe_question_list_semantic(qs)
+
+
 def _adaptive_followup_enabled() -> bool:
     """Adaptive follow-up UI/workflow removed; kept for explicit env override only."""
     return str(os.getenv("INTERVIEW_FOLLOWUP_MODE", "false")).strip().lower() in {
@@ -428,7 +634,7 @@ def _now_ist_parts() -> dict:
 
 
 def _auth_db_target() -> str:
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
+    direct = (os.getenv("AUTH_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
     if direct:
         from auth_db import normalize_postgres_dsn
 
@@ -591,6 +797,8 @@ def _issue_access_token(user: dict, extra_claims: dict | None = None) -> tuple[s
         for key, val in extra_claims.items():
             if val is not None:
                 payload[key] = val
+    if str(user.get("role") or "").lower() == "hr":
+        payload["hr_sub_role"] = str(user.get("hr_sub_role") or "recruiter").strip().lower() or "recruiter"
     token = jwt.encode(payload, _auth_secret(), algorithm="HS256")
     exp_ist = exp_utc.astimezone(IST)
     return token, exp_ist.isoformat()
@@ -761,6 +969,15 @@ def _session_key_from_payload(payload: dict | None) -> str:
     return SESSION_ID
 
 
+def _drop_live_session(session_key: str) -> None:
+    """Remove in-memory session and its mutex after interview teardown."""
+    sk = str(session_key or "").strip()
+    if not sk:
+        return
+    sessions.pop(sk, None)
+    release_session_lock(sk)
+
+
 def _session_key_from_session(session: dict | None) -> str:
     meta = (session or {}).get("meta", {}) or {}
     tok = str(meta.get("invite_token") or "").strip()
@@ -841,7 +1058,7 @@ def _build_answer_response(session: dict, *, is_skipped_answer: bool) -> dict:
         payload_session = {**session, "current": len(answers)}
     next_payload = None
     if not payload_session.get("finalizing"):
-        next_payload = next_question_payload(payload_session)
+        next_payload = next_question_payload(payload_session, db_target=AUTH_DB_TARGET)
     return {
         "status": "ok",
         "answered": len(answers),
@@ -1146,6 +1363,21 @@ def _run_invite_prewarm(invite_token: str, schedule: dict, reason: str) -> None:
         )
 
 
+def _resolve_invite_job_template(invite_cfg: dict | None) -> dict | None:
+    cfg = invite_cfg if isinstance(invite_cfg, dict) else {}
+    jid_from_invite = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+    env_job_id = (os.getenv("INTERVIEW_JOB_ID") or "").strip()
+    job = None
+    if jid_from_invite:
+        job = get_job_template(AUTH_DB_TARGET, jid_from_invite)
+    if not job and env_job_id:
+        job = get_job_template(AUTH_DB_TARGET, env_job_id)
+    if not job:
+        jobs = list_job_templates(AUTH_DB_TARGET)
+        job = jobs[0] if jobs else None
+    return job
+
+
 def _try_restore_invite_session(invite_token: str) -> dict | None:
     """Restore in-memory session from interview_progress (idempotent invite bootstrap)."""
     progress = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token)
@@ -1260,9 +1492,12 @@ def _maybe_prewarm_invite_session(invite_token: str, record: dict, reason: str =
     if not invite_token or not record:
         return
     skey = f"inv:{invite_token}"
-    if sessions.get(skey):
+    existing = sessions.get(skey)
+    if existing and invite_session_playable(existing):
         _set_invite_prewarm_state(invite_token, status="ready", reason=reason, reused=True, latency_ms=0)
         return
+    if existing and not invite_session_playable(existing) and invite_session_safe_to_rebuild(existing):
+        sessions.pop(skey, None)
     access = _invite_access_state(record)
     if access.get("reason") == "expired":
         return
@@ -1290,34 +1525,85 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     bootstrap_started = time.time()
     skey = f"inv:{invite_token}"
     lock = _invite_bootstrap_lock(invite_token)
+    invite_cfg = _extract_invite_config_from_notes(str(schedule.get("notes", "")))
+    job = _resolve_invite_job_template(invite_cfg)
     with lock:
-        if sessions.get(skey):
-            logger.info(
-                "[SESSION] Existing Session Reused",
-                extra={"event": "session.reused.memory", "invite_token": _invite_token_tag(invite_token)},
-            )
-            return {"status": "ok", "session_key": skey, "reused": True}
+        existing = sessions.get(skey)
+        if existing:
+            matches = invite_session_matches_template(existing, job, invite_cfg)
+            playable = invite_session_playable(existing)
+            if matches:
+                if playable:
+                    logger.info(
+                        "[SESSION] Existing Session Reused",
+                        extra={"event": "session.reused.memory", "invite_token": _invite_token_tag(invite_token)},
+                    )
+                    return {
+                        "status": "ok",
+                        "session_key": skey,
+                        "reused": True,
+                        "question_count": len(existing.get("questions") or []),
+                    }
+                if invite_session_safe_to_rebuild(existing):
+                    logger.info(
+                        "[SESSION] Unplayable in-memory session discarded",
+                        extra={"event": "session.discarded.unplayable_memory", "invite_token": _invite_token_tag(invite_token)},
+                    )
+                    sessions.pop(skey, None)
+                else:
+                    logger.warning(
+                        "[SESSION] Unplayable in-memory session kept (answers present)",
+                        extra={"event": "session.reused.unplayable_memory", "invite_token": _invite_token_tag(invite_token)},
+                    )
+                    return {"status": "ok", "session_key": skey, "reused": True}
+            elif invite_session_safe_to_rebuild(existing):
+                logger.info(
+                    "[SESSION] Stale in-memory session discarded",
+                    extra={"event": "session.discarded.stale_memory", "invite_token": _invite_token_tag(invite_token)},
+                )
+                sessions.pop(skey, None)
+            else:
+                logger.warning(
+                    "[SESSION] Stale in-memory session kept (answers present)",
+                    extra={"event": "session.reused.stale_memory", "invite_token": _invite_token_tag(invite_token)},
+                )
+                return {"status": "ok", "session_key": skey, "reused": True}
 
         restored = _try_restore_invite_session(invite_token)
         if restored:
-            sessions[skey] = restored
-            logger.info(
-                "[SESSION] Existing Session Reused",
-                extra={"event": "session.reused.progress", "invite_token": _invite_token_tag(invite_token)},
-            )
-            return {"status": "ok", "session_key": skey, "reused": True, "restored": True}
-
-        invite_cfg = _extract_invite_config_from_notes(str(schedule.get("notes", "")))
-        jid_from_invite = str(invite_cfg.get("job_id") or invite_cfg.get("jobId") or "").strip()
-        env_job_id = (os.getenv("INTERVIEW_JOB_ID") or "").strip()
-        job = None
-        if jid_from_invite:
-            job = get_job_template(AUTH_DB_TARGET, jid_from_invite)
-        if not job and env_job_id:
-            job = get_job_template(AUTH_DB_TARGET, env_job_id)
-        if not job:
-            jobs = list_job_templates(AUTH_DB_TARGET)
-            job = jobs[0] if jobs else None
+            matches = invite_session_matches_template(restored, job, invite_cfg)
+            playable = invite_session_playable(restored)
+            if matches and playable:
+                sessions[skey] = restored
+                logger.info(
+                    "[SESSION] Existing Session Reused",
+                    extra={"event": "session.reused.progress", "invite_token": _invite_token_tag(invite_token)},
+                )
+                return {"status": "ok", "session_key": skey, "reused": True, "restored": True}
+            if matches and not playable and invite_session_safe_to_rebuild(restored):
+                logger.info(
+                    "[SESSION] Unplayable progress discarded — rebuilding from template",
+                    extra={"event": "session.discarded.unplayable_progress", "invite_token": _invite_token_tag(invite_token)},
+                )
+            elif matches and not playable:
+                sessions[skey] = restored
+                logger.warning(
+                    "[SESSION] Unplayable progress kept (answers present)",
+                    extra={"event": "session.reused.unplayable_progress", "invite_token": _invite_token_tag(invite_token)},
+                )
+                return {"status": "ok", "session_key": skey, "reused": True, "restored": True}
+            elif invite_session_safe_to_rebuild(restored):
+                logger.info(
+                    "[SESSION] Stale progress discarded — rebuilding from template",
+                    extra={"event": "session.discarded.stale_progress", "invite_token": _invite_token_tag(invite_token)},
+                )
+            else:
+                sessions[skey] = restored
+                logger.warning(
+                    "[SESSION] Stale progress kept (answers present)",
+                    extra={"event": "session.reused.stale_progress", "invite_token": _invite_token_tag(invite_token)},
+                )
+                return {"status": "ok", "session_key": skey, "reused": True, "restored": True}
 
         jd_text = (job or {}).get("jdText") or (
             "Technical interview for the open role. Assess practical depth, trade-offs, and communication."
@@ -1420,6 +1706,9 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     qt_inv = _coerce_question_type((job or {}).get("questionType"))
     manual_list_inv = _normalized_manual_questions_for_job((job or {}).get("manualQuestions"))
     is_manual_invite = bool(job) and qt_inv == "manual"
+    is_question_bank_invite = bool(job) and qt_inv == "question_bank"
+    qb_snapshot_invite: dict = {}
+    qb_canonical_invite: dict[str, str] = {}
 
     used_saved_preview = False
     if is_manual_invite:
@@ -1449,6 +1738,48 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         pool_q = len(questions)
         num_q = len(questions)
         used_saved_preview = True
+    elif is_question_bank_invite:
+        qb_meta_invite: dict = {}
+        try:
+            questions, qb_snapshot_invite, qb_canonical_invite, qb_meta_invite = _questions_from_question_bank(
+                job=job,
+                weights=weights,
+                pool_q=pool_q,
+                question_seed=question_seed,
+                invite_token=invite_token,
+                candidate_name=cname,
+            )
+        except Exception as exc:
+            return {"error": f"Question Bank selection failed: {exc}"}
+        if not questions:
+            # Question Bank mode must NEVER fall back to AI generation.
+            # If the bank returned 0 questions even after all relaxation levels
+            # (including the "no_exclusions" last-resort pass), the bank is
+            # genuinely empty for this template. Return a clear error so HR can
+            # upload questions rather than silently serving AI questions.
+            logger.error(
+                "question_bank.empty_no_fallback",
+                extra={
+                    "event": "question_bank.empty_no_fallback",
+                    "path": "invite",
+                    "job_id": str((job or {}).get("jobId") or ""),
+                    "role": str((job or {}).get("jobTitle") or ""),
+                    "invite_token": _invite_token_tag(invite_token),
+                    "validation": qb_meta_invite.get("validation", {}),
+                },
+            )
+            return _question_bank_empty_bootstrap_response(qb_meta_invite)
+        else:
+            job_timing = str((job or {}).get("timingMode") or (job or {}).get("timing_mode") or timing_mode or "count").strip().lower()
+            if job_timing == "count":
+                ask_n = clamp_count_mode_questions(
+                    invite_cfg.get("num_q") or (job or {}).get("numQ") or (job or {}).get("num_q") or num_q or 5
+                )
+                if len(questions) > ask_n:
+                    questions = questions[:ask_n]
+            pool_q = len(questions)
+            num_q = len(questions)
+            used_saved_preview = True
     else:
         saved_preview = weights.get("previewQuestions")
         preview_list: list[str] = []
@@ -1516,8 +1847,10 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         else:
             questions = generate_questions_fallback(jd_augmented, "", difficulty, pool_q, required_skills=selected_skills)
 
-        if used_saved_preview:
+        if used_saved_preview and not is_question_bank_invite:
             # Keep template preview exactly as HR saved it (no length cap, no skill-based replacement).
+            questions = [q for q in questions if q][:pool_q]
+        elif used_saved_preview:
             questions = [q for q in questions if q][:pool_q]
         else:
             questions = [q for q in questions if q and len(q) <= 220][:pool_q]
@@ -1532,12 +1865,20 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     if not questions:
         return {"error": "Could not generate interview questions. Set OPENAI_API_KEY and configure a job (HR → ATS / job config), or set INTERVIEW_SAFE_MODE=false with a valid key."}
 
-    questions = prepare_unique_question_sequence(questions, seed=question_seed, limit=pool_q)
-    from utils.question_uniqueness import dedupe_question_list_semantic, record_generated_questions_batch
-
-    questions = dedupe_question_list_semantic(questions)
+    locked_q_source = is_manual_invite or is_question_bank_invite
+    questions = _finalize_bootstrap_question_list(
+        questions,
+        locked_source=locked_q_source,
+        question_seed=question_seed,
+        pool_q=pool_q,
+    )
     if not questions:
         return {"error": "Could not generate unique interview questions for this session."}
+
+    if is_question_bank_invite and qb_canonical_invite:
+        canonical_expected_answers = qb_canonical_invite
+    else:
+        canonical_expected_answers = _resolve_canonical_expected_answers(questions, {})
 
     # Issue 2 (May 2026): prepend a non-evaluated "introduce yourself" warmup
     # so the candidate can settle in / verify audio before scored questions
@@ -1556,8 +1897,26 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     question_categories = [str(x).strip() for x in raw_qc] if isinstance(raw_qc, list) else []
 
     with lock:
-        if sessions.get(skey):
-            return {"status": "ok", "session_key": skey, "reused": True}
+        existing = sessions.get(skey)
+        if existing and invite_session_playable(existing) and invite_session_matches_template(
+            existing, job, invite_cfg
+        ):
+            logger.info(
+                "[SESSION] Bootstrap reused concurrent session",
+                extra={
+                    "event": "session.reused.bootstrap_race",
+                    "invite_token": _invite_token_tag(invite_token),
+                    "template_id": str((job or {}).get("jobId") or ""),
+                    "question_type": qt_inv,
+                    "question_source": str((existing.get("meta") or {}).get("question_source") or ""),
+                },
+            )
+            return {
+                "status": "ok",
+                "session_key": skey,
+                "reused": True,
+                "question_count": len(existing.get("questions") or []),
+            }
 
         sessions[skey] = {
         "meta": {
@@ -1570,9 +1929,19 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "num_q": num_q,
             "model": selected_model,
             "generation_mode": (
-                "manual" if is_manual_invite else ("ai" if has_ai and not safe_mode_on else "fallback")
+                "manual"
+                if is_manual_invite
+                else "question_bank"
+                if is_question_bank_invite
+                else ("ai" if has_ai and not safe_mode_on else "fallback")
             ),
-            "question_source": "manual" if is_manual_invite else "dynamic",
+            "question_source": (
+                "manual"
+                if is_manual_invite
+                else "QUESTION_BANK"
+                if is_question_bank_invite
+                else "dynamic"
+            ),
             "safe_mode": safe_mode_on,
             "candidate_profile": candidate_profile,
             "candidate_experience": invite_experience,
@@ -1597,7 +1966,9 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             if str(difficulty).strip().lower() in ("easy", "medium", "hard")
             else "medium",
             "followups_added": 0,
-            "max_followups": 0 if (is_manual_invite or not followup_mode_on) else max(0, pool_q - len(selected_skills)),
+            "max_followups": 0
+            if (is_manual_invite or is_question_bank_invite or not followup_mode_on)
+            else max(0, pool_q - len(selected_skills)),
             "job_id": str((job or {}).get("jobId") or ""),
             "job_title": job_title,
             "invite_token": invite_token,
@@ -1606,8 +1977,16 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "asked_questions": [],
             "pool_generated": len(questions),
             "warmup_indices": warmup_indices,
+            "canonical_expected_answers": canonical_expected_answers,
             "template_prompt": effective_prompt,
-            "adaptive_next_question": bool((weights or {}).get("adaptiveNextQuestion", False)),
+            "adaptive_next_question": False
+            if is_question_bank_invite
+            else bool((weights or {}).get("adaptiveNextQuestion", False)),
+            **(
+                {"question_bank_snapshot": qb_snapshot_invite}
+                if is_question_bank_invite and qb_snapshot_invite
+                else {}
+            ),
         },
         "questions": questions,
         "answers": [],
@@ -1618,10 +1997,18 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         stamp_time_warning_settings(sessions[skey]["meta"], weights)
         stamp_auto_advance_settings(sessions[skey]["meta"], weights)
         stamp_introduction_question_types(sessions[skey]["meta"], warmup_indices)
+        from utils.question_uniqueness import record_generated_questions_batch
+
         record_generated_questions_batch(
             sessions[skey],
             questions,
-            source="manual" if is_manual_invite else "dynamic",
+            source=(
+                "manual"
+                if is_manual_invite
+                else "question_bank"
+                if is_question_bank_invite
+                else "dynamic"
+            ),
         )
         _persist_interview_progress(sessions[skey], status="started")
         latency_ms = int((time.time() - bootstrap_started) * 1000)
@@ -1634,6 +2021,28 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
                 "questions": len(questions),
                 "fast_only": fast_only,
                 "latency_ms": latency_ms,
+                "template_id": str((job or {}).get("jobId") or ""),
+                "question_type": qt_inv,
+                "question_source": (
+                    "manual"
+                    if is_manual_invite
+                    else "QUESTION_BANK"
+                    if is_question_bank_invite
+                    else "dynamic"
+                ),
+                "question_origin": (
+                    "question_bank"
+                    if is_question_bank_invite
+                    else "manual"
+                    if is_manual_invite
+                    else ("ai" if has_ai and not safe_mode_on and not fast_only else "fallback")
+                ),
+                "openai_generation_called": "NO",
+                "question_ids": [
+                    str((qb_snapshot_invite.get(str(i)) or {}).get("question_id") or "")
+                    for i in range(len(questions))
+                    if is_question_bank_invite and qb_snapshot_invite
+                ][:15],
             },
         )
         return {"status": "ok", "session_key": skey, "question_count": len(questions), "fast_only": fast_only, "latency_ms": latency_ms}
@@ -1649,6 +2058,18 @@ def _require_user(request: Request, allowed_roles: set[str] | None = None):
     return payload, None
 
 
+def _require_hr_permission(request: Request, permission: str, *, allowed_roles: set[str] | None = None):
+    payload, auth_err = _require_user(request, allowed_roles or {"hr", "manager", "admin"})
+    if auth_err:
+        return None, auth_err
+    from routers.question_bank import is_super_admin
+    from utils.rbac import has_permission, permission_denied_message
+
+    if not has_permission(payload, permission, is_super_admin=is_super_admin(payload or {})):
+        return None, JSONResponse({"error": permission_denied_message(permission)}, status_code=403)
+    return payload, None
+
+
 def _parse_cors_origins() -> list[str]:
     raw = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
     if not raw:
@@ -1658,12 +2079,16 @@ def _parse_cors_origins() -> list[str]:
 
 
 def _runtime_core_checks() -> dict:
+    redis_url = (os.getenv("REDIS_URL") or "").strip()
     return {
         "data_dir_exists": DATA_DIR.exists(),
         "data_file_parent_writable": DATA_FILE.parent.exists() and os.access(DATA_FILE.parent, os.W_OK),
         "hr_code_file_exists": HR_ACCESS_CODE_FILE.exists(),
         "database_connected": _auth_db_ping(),
         "database_backend": "postgresql" if str(AUTH_DB_TARGET).startswith(("postgresql://", "postgres://")) else "sqlite",
+        "session_backend": session_backend(),
+        "redis_connected": (not redis_url) or redis_available(),
+        "job_backend": job_backend(),
     }
 
 
@@ -1781,11 +2206,12 @@ def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
     has_ai_key = bool((os.getenv("OPENAI_API_KEY") or "").strip())
     raw_q = list(session.get("questions") or [])
     raw_a = list(session.get("answers") or [])
-    # Issue 2 (May 2026): drop the non-evaluated warmup turn from every
-    # evaluation input. Scoring, communication scoring AND per-question
-    # evaluations are computed over the filtered lists so the warmup never
-    # appears in the HR report's score breakdown.
+    intro_q, intro_a = extract_warmup_qa(raw_q, raw_a, meta)
+    intro_eval = evaluate_introduction_answer(intro_q, intro_a, model=model) if intro_q else {}
+    # Issue 2 (May 2026): drop the non-evaluated warmup turn from technical
+    # evaluation inputs. Communication scoring uses all answered turns below.
     full_q, full_a = filter_out_warmups(raw_q, raw_a, meta)
+    comm_q, comm_a, _comm_scope = align_qa_to_answered_turns(raw_q, raw_a)
     # May 2026: score only answered turns — not the prefetched question pool.
     q_answered, a_answered, scope_meta = align_qa_to_answered_turns(full_q, full_a)
     q_eval, a_eval, _scr_meta = slice_qa_for_final_evaluation(q_answered, a_answered)
@@ -1806,8 +2232,17 @@ def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
         result["evaluation_mode"] = "fallback_exception"
 
     comm_result = evaluate_communication_skills(
-        q_eval, a_eval, model=model
+        comm_q, comm_a, model=model
     )
+    result["introduction_evaluation"] = intro_eval
+    if intro_q:
+        result["introduction_turn"] = {
+            "question": intro_q,
+            "answer": intro_a,
+            "excluded_from_score": True,
+            "excluded_reason": "Introduction warmup (not counted toward overall score).",
+            "evaluation": intro_eval if isinstance(intro_eval, dict) else {},
+        }
     result["communication_evaluation"] = comm_result
 
     result = merge_per_question_eval_into_report(
@@ -1910,6 +2345,66 @@ def _session_from_progress(progress: dict | None) -> dict | None:
     sess.setdefault("completed", False)
     sess.setdefault("submitted", False)
     return sess
+
+
+def _session_from_interview_record(record: dict | None) -> dict | None:
+    if not record or not isinstance(record, dict):
+        return None
+    report = record.get("report") if isinstance(record.get("report"), dict) else {}
+    meta = {
+        "interview_id": str(record.get("id") or record.get("interview_id") or ""),
+        "jd_skills": list(record.get("jd_skills") or report.get("jd_skills") or []),
+        "jd_text": str(record.get("jd_text") or report.get("jd_text") or ""),
+        "model": str(record.get("model") or report.get("model") or os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini"),
+        "candidate_profile": record.get("candidate_profile") or {},
+        "question_source": str(record.get("question_source") or report.get("question_source") or ""),
+    }
+    return {
+        "meta": meta,
+        "questions": list(record.get("questions") or report.get("questions") or []),
+        "answers": list(record.get("answers") or report.get("answers") or []),
+        "current": len(record.get("answers") or report.get("answers") or []),
+        "completed": True,
+        "submitted": True,
+    }
+
+
+def _bulk_rescore_interviews(interview_ids: list[str], *, actor: dict | None = None) -> None:
+    from utils.audit_log import write_audit_log
+
+    for iid in interview_ids:
+        interview_id = str(iid or "").strip()
+        if not interview_id:
+            continue
+        rec = get_interview_record_payload(AUTH_DB_TARGET, interview_id)
+        if not rec:
+            rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
+        if not rec:
+            logger.warning("bulk_rescore.missing_record", extra={"interview_id": interview_id})
+            continue
+        sess = _session_from_interview_record(rec)
+        if not sess:
+            continue
+        try:
+            result, _, report_record = _evaluate_and_store_report(sess)
+            report_record["rescore_at_ist"] = _now_ist_parts()["ist_iso"]
+            upsert_interview_record_snapshot(AUTH_DB_TARGET, report_record)
+            _persist_hr_record_mirror(report_record)
+            write_audit_log(
+                AUTH_DB_TARGET,
+                actor=actor,
+                action="reports.rescore",
+                resource_type="interview",
+                resource_id=interview_id,
+                details={"overall_score": result.get("overall_score")},
+            )
+        except Exception as exc:
+            logger.warning(
+                "bulk_rescore.failed",
+                extra={"interview_id": interview_id, "error": str(exc)[:300]},
+                exc_info=True,
+            )
+    invalidate_hr_dashboard_cache()
 
 
 def _fallback_report_result(session: dict, reason: str, final_status: str, error: str = "") -> dict:
@@ -2099,7 +2594,7 @@ def _upgrade_interview_report_background(session_snapshot: dict, reason: str, fi
         _persist_interview_progress(session_snapshot, status=final_status, report_status="ready")
         append_from_evaluation(meta.get("jd_skills", []), result, str(meta.get("interview_id", "")))
         sk = _session_key_from_session(session_snapshot)
-        sessions.pop(sk, None)
+        _drop_live_session(sk)
         logger.info(
             "interview.report.upgraded.background",
             extra={
@@ -2174,7 +2669,7 @@ def _recover_interviews_once(limit: int = 100) -> int:
             out = _finalize_interview_snapshot(sess, reason=reason, final_status=final_status)
             token = str((sess.get("meta", {}) or {}).get("invite_token") or row.get("invite_token") or "").strip()
             if token:
-                sessions.pop(f"inv:{token}", None)
+                _drop_live_session(f"inv:{token}")
             recovered += 1
             logger.info(
                 "interview.recovery.finalized",
@@ -2230,10 +2725,25 @@ def _start_interview_recovery_worker() -> None:
     if workers > 1 and not redis_url:
         logger.warning(
             "UVICORN_WORKERS=%s without REDIS_URL — in-memory sessions/proctor state are not shared across workers. "
-            "Use UVICORN_WORKERS=1 until Redis-backed sessions exist.",
+            "Set REDIS_URL for Redis-backed sessions or keep UVICORN_WORKERS=1.",
             workers,
             extra={"event": "startup.multi_worker_warning", "workers": workers},
         )
+    elif redis_url and redis_available():
+        logger.info(
+            "session_store.redis.enabled",
+            extra={"event": "session_store.redis.enabled", "backend": session_backend()},
+        )
+    try:
+        from auth_db import ensure_hr_enterprise_schema
+
+        ensure_hr_enterprise_schema(AUTH_DB_TARGET)
+    except Exception as err:
+        logger.warning("hr.enterprise.schema.init.failed", extra={"error": str(err)[:200]})
+    try:
+        start_job_worker()
+    except Exception as err:
+        logger.warning("job.worker.start.failed", extra={"error": str(err)[:200]})
     if _RECOVERY_WORKER_STARTED:
         return
     _RECOVERY_WORKER_STARTED = True
@@ -2281,8 +2791,20 @@ DATA_FILE = HR_RECORDS_FILE
 
 ensure_project_dirs()
 migrate_legacy_data_files()
-_auth_db_url_configured = bool((os.getenv("AUTH_DB_URL") or "").strip())
+_auth_db_url_configured = bool((os.getenv("AUTH_DB_URL") or os.getenv("DATABASE_URL") or "").strip())
 AUTH_DB_TARGET = _auth_db_target()
+logger.info(
+    "auth.db.target",
+    extra={
+        "event": "auth.db.target",
+        "backend": "postgresql" if str(AUTH_DB_TARGET).startswith(("postgresql://", "postgres://")) else "sqlite",
+        "host": (
+            "local"
+            if "localhost" in str(AUTH_DB_TARGET) or "127.0.0.1" in str(AUTH_DB_TARGET)
+            else ("remote" if str(AUTH_DB_TARGET).startswith(("postgresql://", "postgres://")) else "sqlite-file")
+        ),
+    },
+)
 try:
     init_auth_db(AUTH_DB_TARGET)
 except Exception as err:
@@ -2300,7 +2822,19 @@ except Exception as err:
     logger.warning("prompt_log.table.init.failed", extra={"event": "prompt_log.table.init.failed", "error": str(err)})
 
 try:
-    bulk_import_interview_records(AUTH_DB_TARGET, load_hr_records(DATA_FILE))
+    from services.question_bank.repository import ensure_question_bank_tables
+
+    ensure_question_bank_tables(AUTH_DB_TARGET)
+except Exception as err:
+    logger.warning("question_bank.table.init.failed", extra={"event": "question_bank.table.init.failed", "error": str(err)})
+
+try:
+    _import_mode = str(os.getenv("HR_RECORDS_IMPORT_ON_STARTUP", "auto")).strip().lower()
+    _should_import = _import_mode in {"1", "true", "yes", "on"}
+    if not _should_import and _import_mode not in {"0", "false", "no", "off"}:
+        _should_import = count_interview_records(AUTH_DB_TARGET) == 0
+    if _should_import:
+        bulk_import_interview_records(AUTH_DB_TARGET, load_hr_records(DATA_FILE))
 except Exception as err:
     logger.warning("auth.db.import.records.failed", extra={"event": "auth.db.import.records.failed", "error": str(err)})
 
@@ -2621,6 +3155,9 @@ async def setup(
     qt_setup = _coerce_question_type((job_cfg_row or {}).get("questionType"))
     manual_list_setup = _normalized_manual_questions_for_job((job_cfg_row or {}).get("manualQuestions"))
     is_manual_interview = bool(job_id_setup and job_cfg_row and qt_setup == "manual")
+    is_question_bank_setup = bool(job_id_setup and job_cfg_row and qt_setup == "question_bank")
+    qb_snapshot_setup: dict = {}
+    qb_canonical_setup: dict[str, str] = {}
 
     used_setup_saved_preview = False
     if is_manual_interview:
@@ -2648,6 +3185,43 @@ async def setup(
         num_q = len(questions)
         used_setup_saved_preview = True
         warning = ""
+    elif is_question_bank_setup:
+        try:
+            questions, qb_snapshot_setup, qb_canonical_setup, qb_meta_setup = _questions_from_question_bank(
+                job=job_cfg_row,
+                weights=weights_for_suite,
+                pool_q=pool_q,
+                question_seed=question_seed,
+            )
+        except Exception as exc:
+            return {"error": f"Question Bank selection failed: {exc}"}
+        if not questions:
+            # Question Bank mode must NEVER fall back to AI generation.
+            # If the bank returned 0 questions even after all relaxation levels
+            # (including the "no_exclusions" last-resort pass), the bank is
+            # genuinely empty for this template. Return a clear error so HR can
+            # upload questions rather than silently serving AI questions.
+            logger.error(
+                "question_bank.empty_no_fallback",
+                extra={
+                    "event": "question_bank.empty_no_fallback",
+                    "path": "setup",
+                    "job_id": str(job_id_setup or ""),
+                    "role": str((job_cfg_row or {}).get("jobTitle") or ""),
+                    "validation": qb_meta_setup.get("validation", {}),
+                },
+            )
+            return _question_bank_empty_bootstrap_response(qb_meta_setup)
+        else:
+            setup_timing = str((job_cfg_row or {}).get("timingMode") or (job_cfg_row or {}).get("timing_mode") or timing_mode_val or "count").strip().lower()
+            if setup_timing == "count":
+                ask_n = clamp_count_mode_questions(num_q or (job_cfg_row or {}).get("numQ") or (job_cfg_row or {}).get("num_q") or 5)
+                if len(questions) > ask_n:
+                    questions = questions[:ask_n]
+            pool_q = len(questions)
+            num_q = len(questions)
+            used_setup_saved_preview = True
+            warning = ""
     else:
         setup_preview = weights_for_suite.get("previewQuestions")
         setup_preview_list: list[str] = []
@@ -2725,7 +3299,9 @@ async def setup(
                 else "No API key detected. Using fallback generation aligned to final skills."
             )
 
-        if used_setup_saved_preview:
+        if used_setup_saved_preview and not is_question_bank_setup:
+            questions = [q for q in questions if q][:pool_q]
+        elif used_setup_saved_preview:
             questions = [q for q in questions if q][:pool_q]
         else:
             questions = [q for q in questions if q and len(q) <= 180]
@@ -2738,12 +3314,22 @@ async def setup(
     if not questions:
         return {"error": "No questions generated. Please retry with better JD/CV content."}
 
-    questions = prepare_unique_question_sequence(questions, seed=question_seed, limit=pool_q)
-    from utils.question_uniqueness import dedupe_question_list_semantic, record_generated_questions_batch
-
-    questions = dedupe_question_list_semantic(questions)
+    locked_setup_source = is_manual_interview or is_question_bank_setup
+    questions = _finalize_bootstrap_question_list(
+        questions,
+        locked_source=locked_setup_source,
+        question_seed=question_seed,
+        pool_q=pool_q,
+    )
     if not questions:
         return {"error": "No unique questions generated. Please retry with better JD/CV content."}
+
+    from utils.question_uniqueness import record_generated_questions_batch
+
+    if is_question_bank_setup and qb_canonical_setup:
+        canonical_expected_answers_setup = qb_canonical_setup
+    else:
+        canonical_expected_answers_setup = _resolve_canonical_expected_answers(questions, {})
 
     # Issue 2 (May 2026): inject the introduce-yourself warmup at index 0.
     # The /setup HR-direct path mirrors the invite flow so both entrypoints
@@ -2783,8 +3369,20 @@ async def setup(
             "difficulty": difficulty,
             "num_q": num_q,
             "model": selected_model,
-            "generation_mode": ("manual" if is_manual_interview else ("ai" if not warning else "fallback")),
-            "question_source": "manual" if is_manual_interview else "dynamic",
+            "generation_mode": (
+                "manual"
+                if is_manual_interview
+                else "question_bank"
+                if is_question_bank_setup
+                else ("ai" if not warning else "fallback")
+            ),
+            "question_source": (
+                "manual"
+                if is_manual_interview
+                else "QUESTION_BANK"
+                if is_question_bank_setup
+                else "dynamic"
+            ),
             "safe_mode": safe_mode_on,
             "candidate_profile": candidate_profile,
             "candidate_experience": candidate_experience,
@@ -2810,7 +3408,7 @@ async def setup(
             else "medium",
             "followups_added": 0,
             "max_followups": 0
-            if (is_manual_interview or not followup_mode_on)
+            if (is_manual_interview or is_question_bank_setup or not followup_mode_on)
             else max(0, pool_q - len(selected_skills)),
             "job_id": job_id_setup,
             "job_title": job_title_for_session,
@@ -2818,8 +3416,16 @@ async def setup(
             "asked_questions": [],
             "pool_generated": len(questions),
             "warmup_indices": warmup_indices,
+            "canonical_expected_answers": canonical_expected_answers_setup,
             "template_prompt": effective_prompt_setup,
-            "adaptive_next_question": bool((weights_for_suite or {}).get("adaptiveNextQuestion", False)),
+            "adaptive_next_question": False
+            if is_question_bank_setup
+            else bool((weights_for_suite or {}).get("adaptiveNextQuestion", False)),
+            **(
+                {"question_bank_snapshot": qb_snapshot_setup}
+                if is_question_bank_setup and qb_snapshot_setup
+                else {}
+            ),
         },
         "questions": questions,
         "answers": [],
@@ -2833,7 +3439,13 @@ async def setup(
     record_generated_questions_batch(
         sessions[setup_session_key],
         questions,
-        source="manual" if is_manual_interview else "dynamic",
+        source=(
+            "manual"
+            if is_manual_interview
+            else "question_bank"
+            if is_question_bank_setup
+            else "dynamic"
+        ),
     )
     _persist_interview_progress(sessions[setup_session_key], status="started")
     logger.info(
@@ -2842,6 +3454,23 @@ async def setup(
             "event": "interview.setup.completed",
             "interview_id": interview_id,
             "candidate_name": candidate_profile.get("name", "Candidate"),
+            "template_id": str(job_id_setup or ""),
+            "question_type": qt_setup,
+            "question_source": (
+                "manual"
+                if is_manual_interview
+                else "QUESTION_BANK"
+                if is_question_bank_setup
+                else "dynamic"
+            ),
+            "openai_generation_called": "NO"
+            if (is_manual_interview or is_question_bank_setup)
+            else "YES",
+            "question_ids": [
+                str((qb_snapshot_setup.get(str(i)) or {}).get("question_id") or "")
+                for i in range(len(questions))
+                if is_question_bank_setup and qb_snapshot_setup
+            ][:15],
         },
     )
 
@@ -2935,53 +3564,54 @@ def next_question(request: Request):
     if auth_err:
         return auth_err
     sk = _session_key_from_payload(payload)
-    s = sessions.get(sk)
-    if not s:
-        invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
-        recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
-        s = _session_from_progress(recovered)
-        if s:
-            sessions[sk] = s
+    with session_lock(sk):
+        s = sessions.get(sk)
+        if not s:
+            invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
+            recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
+            s = _session_from_progress(recovered)
+            if s:
+                sessions[sk] = s
+                logger.info(
+                    "[SESSION] Existing Session Reused",
+                    extra={"event": "session.reused.next", "invite_token": _invite_token_tag(invite_token_from_token)},
+                )
+        if not s:
+            return {"error": "No active session. Run setup first."}
+        if s.get("finalizing"):
+            return {"message": "Interview completed"}
+        meta = s.get("meta", {}) or {}
+        _persist_interview_progress(s, status=_progress_status_for_session(s))
+        invite_token = str(meta.get("invite_token") or "").strip()
+        if invite_token and not meta.get("startup_first_next_logged"):
+            login_started_raw = str(meta.get("startup_login_accepted_at_utc") or "").strip()
+            login_to_first_next_ms = 0
+            login_latency_ms = int(meta.get("startup_login_latency_ms") or 0)
+            if login_started_raw:
+                try:
+                    login_dt = datetime.fromisoformat(login_started_raw)
+                    if login_dt.tzinfo is None:
+                        login_dt = login_dt.replace(tzinfo=timezone.utc)
+                    login_to_first_next_ms = int((datetime.now(timezone.utc) - login_dt).total_seconds() * 1000)
+                except Exception:
+                    login_to_first_next_ms = 0
+            startup_total_ms = max(0, login_latency_ms) + max(0, login_to_first_next_ms)
             logger.info(
-                "[SESSION] Existing Session Reused",
-                extra={"event": "session.reused.next", "invite_token": _invite_token_tag(invite_token_from_token)},
+                "interview.invite.first_next",
+                extra={
+                    "event": "interview.invite.first_next",
+                    "invite_token": _invite_token_tag(invite_token),
+                    "login_latency_ms": login_latency_ms,
+                    "login_to_first_next_ms": max(0, login_to_first_next_ms),
+                    "startup_total_ms": startup_total_ms,
+                    "prewarm_status": str(meta.get("startup_prewarm_status") or ""),
+                    "prewarm_latency_ms": int(meta.get("startup_prewarm_latency_ms") or 0),
+                    "question_index": int(s.get("current") or 0),
+                },
             )
-    if not s:
-        return {"error": "No active session. Run setup first."}
-    if s.get("finalizing"):
-        return {"message": "Interview completed"}
-    meta = s.get("meta", {}) or {}
-    _persist_interview_progress(s, status=_progress_status_for_session(s))
-    invite_token = str(meta.get("invite_token") or "").strip()
-    if invite_token and not meta.get("startup_first_next_logged"):
-        login_started_raw = str(meta.get("startup_login_accepted_at_utc") or "").strip()
-        login_to_first_next_ms = 0
-        login_latency_ms = int(meta.get("startup_login_latency_ms") or 0)
-        if login_started_raw:
-            try:
-                login_dt = datetime.fromisoformat(login_started_raw)
-                if login_dt.tzinfo is None:
-                    login_dt = login_dt.replace(tzinfo=timezone.utc)
-                login_to_first_next_ms = int((datetime.now(timezone.utc) - login_dt).total_seconds() * 1000)
-            except Exception:
-                login_to_first_next_ms = 0
-        startup_total_ms = max(0, login_latency_ms) + max(0, login_to_first_next_ms)
-        logger.info(
-            "interview.invite.first_next",
-            extra={
-                "event": "interview.invite.first_next",
-                "invite_token": _invite_token_tag(invite_token),
-                "login_latency_ms": login_latency_ms,
-                "login_to_first_next_ms": max(0, login_to_first_next_ms),
-                "startup_total_ms": startup_total_ms,
-                "prewarm_status": str(meta.get("startup_prewarm_status") or ""),
-                "prewarm_latency_ms": int(meta.get("startup_prewarm_latency_ms") or 0),
-                "question_index": int(s.get("current") or 0),
-            },
-        )
-        meta["startup_first_next_logged"] = True
+            meta["startup_first_next_logged"] = True
 
-    return next_question_payload(s)
+        return next_question_payload(s, db_target=AUTH_DB_TARGET)
 
 
 @app.post("/candidate/transcribe")
@@ -3016,6 +3646,55 @@ async def transcribe_candidate_audio(
         return {"error": "Transcription service unavailable. Please retry in a moment."}
     except Exception:
         return {"error": "Transcription failed. Please retry."}
+
+
+@app.post("/candidate/analyze-answer-completion")
+async def analyze_candidate_answer_completion(request: Request):
+    """OpenAI-backed answer completion check for smart auto-advance."""
+    _, auth_err = _require_user(request, {"hr", "candidate"})
+    if auth_err:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    question_text = str(body.get("question_text") or body.get("question") or "").strip()
+    transcript = str(body.get("transcript") or body.get("answer") or "").strip()
+    try:
+        silence_duration_sec = float(body.get("silence_duration_sec") or 0)
+    except (TypeError, ValueError):
+        silence_duration_sec = 0.0
+    is_still_speaking = bool(body.get("is_still_speaking"))
+    try:
+        silence_threshold_sec = float(body.get("silence_threshold_sec") or 2.5)
+    except (TypeError, ValueError):
+        silence_threshold_sec = 2.5
+    from utils.answer_completion import analyze_answer_completion
+
+    result = await run_in_threadpool(
+        analyze_answer_completion,
+        question_text=question_text,
+        transcript=transcript,
+        silence_duration_sec=silence_duration_sec,
+        is_still_speaking=is_still_speaking,
+        silence_threshold_sec=silence_threshold_sec,
+    )
+    logger.info(
+        "[INTERVIEW] analyze-answer-completion",
+        extra={
+            "event": "interview.analyze_answer_completion",
+            "question_preview": question_text[:120],
+            "transcript_len": len(transcript),
+            "silence_duration_sec": silence_duration_sec,
+            "is_still_speaking": is_still_speaking,
+            "status": result.get("status"),
+            "confidence": result.get("confidence"),
+            "source": result.get("source", "unknown"),
+        },
+    )
+    return result
 
 
 @app.post("/candidate/validate-speech")
@@ -3128,7 +3807,7 @@ def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: s
 
 def _expand_time_mode_pool(session: dict) -> None:
     meta = session.get("meta", {})
-    if str(meta.get("question_source") or "") == "manual":
+    if is_locked_question_source(meta):
         return
     if str(meta.get("timing_mode") or "") != "time":
         return
@@ -3307,27 +3986,25 @@ def answer(
                 action_clean = "send"
                 ans_clean = answer_text
         if is_skipped_answer and aa_meta:
-            trigger = str(aa_meta.get("trigger") or "").strip().lower()
-            if trigger == "no_response":
-                allowed, block_reason = skip_allowed_by_speech_evidence(aa_meta)
-                if not allowed:
-                    _append_answer_audit(
-                        session_key=sk,
-                        current_index=int(s.get("current", 0) or 0),
-                        action=action_clean,
-                        answer_text=ans_clean,
-                        is_skipped_answer=True,
-                        status="rejected_speech_evidence",
-                        reason=block_reason or "speech_detected",
-                    )
-                    return JSONResponse(
-                        {
-                            "error": "Skip blocked: candidate speech detected.",
-                            "speech_blocked": True,
-                            "reason": block_reason or "speech_detected",
-                        },
-                        status_code=409,
-                    )
+            allowed, block_reason = skip_allowed_by_speech_evidence(aa_meta)
+            if not allowed:
+                _append_answer_audit(
+                    session_key=sk,
+                    current_index=int(s.get("current", 0) or 0),
+                    action=action_clean,
+                    answer_text=ans_clean,
+                    is_skipped_answer=True,
+                    status="rejected_speech_evidence",
+                    reason=block_reason or "speech_detected",
+                )
+                return JSONResponse(
+                    {
+                        "error": "Skip blocked: candidate speech detected.",
+                        "speech_blocked": True,
+                        "reason": block_reason or "speech_detected",
+                    },
+                    status_code=409,
+                )
         if action_clean == "send" and ans_clean.strip().lower() in {"skip", "skipped", "[skipped]"} and len(ans_clean) <= 12:
             _append_answer_audit(
                 session_key=sk,
@@ -3349,10 +4026,13 @@ def answer(
                     "event": "interview.answer.received",
                     "session_key": sk,
                     "current_index": int(s.get("current", 0) or 0),
+                    "question_index": turn_index,
                     "action": action_clean,
                     "answer_len": len(ans_clean),
                     "is_skipped_answer": bool(is_skipped_answer),
                     "answer_preview": ans_clean[:120],
+                    "speech_confirmed": bool((aa_meta or {}).get("speech_confirmed")),
+                    "transcript_len": int((aa_meta or {}).get("interim_transcript_len") or len(str((aa_meta or {}).get("capture_text") or ""))),
                 },
             )
         except Exception:
@@ -3408,7 +4088,7 @@ def answer(
         )
         remember_asked_question(s, previous_question)
         meta = s.get("meta", {})
-        is_manual_session = str(meta.get("question_source") or "") == "manual"
+        locked_questions = is_locked_question_source(meta)
         is_warmup_turn = is_warmup_index(meta, s["current"])
         if not is_warmup_turn and not is_skipped_answer:
             append_interview_turn(
@@ -3431,7 +4111,7 @@ def answer(
                 seen_skills.add(det)
         missing_skills = [skill for skill in jd_skills if skill and skill not in seen_skills]
 
-        if not is_manual_session and missing_skills and idx_next < len(s["questions"]):
+        if not locked_questions and missing_skills and idx_next < len(s["questions"]):
             next_skill = detect_skill_from_question(s["questions"][idx_next], jd_skills)
             if next_skill not in missing_skills:
                 from utils.question_uniqueness import regenerate_unique_fallback_question
@@ -3445,7 +4125,7 @@ def answer(
                     )
 
         if (
-            not is_manual_session
+            not locked_questions
             and not is_warmup_turn
             and not is_skipped_answer
             and not s.get("finalizing")
@@ -3494,7 +4174,7 @@ def answer(
             and not is_warmup_turn
             and not is_skipped_answer
             and not s.get("finalizing")
-            and not is_manual_session
+            and not locked_questions
             and not missing_skills
             and meta.get("followup_mode", False)
             and meta.get("followups_added", 0) < meta.get("max_followups", 0)
@@ -3544,7 +4224,7 @@ def answer(
 
         next_payload = None
         if not s.get("finalizing"):
-            next_payload = next_question_payload(s)
+            next_payload = next_question_payload(s, db_target=AUTH_DB_TARGET)
             if meta.get("pending_tts_invalidate"):
                 next_payload["tts_invalidate"] = True
                 meta["pending_tts_invalidate"] = False
@@ -3726,85 +4406,86 @@ def submit(
     if device_err:
         return device_err
     sk = _session_key_from_payload(payload)
-    s = sessions.get(sk)
-    if not s:
-        invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
-        recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
-        s = _session_from_progress(recovered)
+    with session_lock(sk):
+        s = sessions.get(sk)
         if not s:
-            return {"error": "No active session."}
-        sessions[sk] = s
-    if s.get("finalizing") and s.get("report_result"):
-        existing_id = str((s.get("meta", {}) or {}).get("interview_id") or "")
-        return {"status": "submitted", "report_ready": True, "interview_id": existing_id, "reused_report": True}
-    s["finalizing"] = True
-    time_expired_flag = str(time_expired or "").strip().lower() in ("1", "true", "yes", "on")
-    finalize_via_clean = str(finalize_via or "").strip().lower()
-    auto_saved_flag = str(boundary_auto_saved or "").strip().lower() in ("1", "true", "yes", "on")
-    pending_appended = _append_pending_answer_on_submit(s, pending_answer)
-    _record_boundary_question_meta(
-        s,
-        time_expired=time_expired_flag,
-        finalize_via=finalize_via_clean,
-        auto_saved=auto_saved_flag,
-        pending_appended=pending_appended,
-    )
-    meta = s.get("meta", {})
-    bg_finalize = str(background_finalize or "").strip().lower() in ("1", "true", "yes", "on")
-    final_status = "completed"
-    reason = "candidate_submitted"
-    if meta.get("termination_reason") or s.get("terminated"):
-        final_status = "terminated"
-        reason = str(meta.get("termination_reason") or "terminated")
-    elif time_expired_flag:
-        final_status = "partially_completed" if int(s.get("current") or 0) < len(s.get("questions") or []) else "completed"
-        reason = "time_expired"
-    elif int(s.get("current") or 0) < len(s.get("questions") or []):
-        final_status = "partially_completed"
-        reason = "candidate_ended_early"
+            invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
+            recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
+            s = _session_from_progress(recovered)
+            if not s:
+                return {"error": "No active session."}
+            sessions[sk] = s
+        if s.get("finalizing") and s.get("report_result"):
+            existing_id = str((s.get("meta", {}) or {}).get("interview_id") or "")
+            return {"status": "submitted", "report_ready": True, "interview_id": existing_id, "reused_report": True}
+        s["finalizing"] = True
+        time_expired_flag = str(time_expired or "").strip().lower() in ("1", "true", "yes", "on")
+        finalize_via_clean = str(finalize_via or "").strip().lower()
+        auto_saved_flag = str(boundary_auto_saved or "").strip().lower() in ("1", "true", "yes", "on")
+        pending_appended = _append_pending_answer_on_submit(s, pending_answer)
+        _record_boundary_question_meta(
+            s,
+            time_expired=time_expired_flag,
+            finalize_via=finalize_via_clean,
+            auto_saved=auto_saved_flag,
+            pending_appended=pending_appended,
+        )
+        meta = s.get("meta", {})
+        bg_finalize = str(background_finalize or "").strip().lower() in ("1", "true", "yes", "on")
+        final_status = "completed"
+        reason = "candidate_submitted"
+        if meta.get("termination_reason") or s.get("terminated"):
+            final_status = "terminated"
+            reason = str(meta.get("termination_reason") or "terminated")
+        elif time_expired_flag:
+            final_status = "partially_completed" if int(s.get("current") or 0) < len(s.get("questions") or []) else "completed"
+            reason = "time_expired"
+        elif int(s.get("current") or 0) < len(s.get("questions") or []):
+            final_status = "partially_completed"
+            reason = "candidate_ended_early"
 
-    candidate_fast_finalize = bg_finalize or str((payload or {}).get("role") or "").lower() == "candidate"
-    logger.info(
-        "[FLOW] INTERVIEW_ENDED",
-        extra={"event": "interview.ended", "interview_id": str(meta.get("interview_id") or "")},
-    )
-    logger.info(
-        "[FLOW] REPORT_STARTED",
-        extra={"event": "report.generation.started", "interview_id": str(meta.get("interview_id") or "")},
-    )
-    if candidate_fast_finalize:
-        session_snapshot = copy.deepcopy(s)
-        out = _persist_fast_final_report(s, reason=reason, final_status=final_status)
-        background_tasks.add_task(_upgrade_interview_report_background, session_snapshot, reason, final_status)
-    else:
-        out = _finalize_interview_snapshot(s, reason=reason, final_status=final_status)
-    if bg_finalize:
-        out["background_finalize"] = False
-        out["synchronous_finalize"] = True
-    logger.info(
-        "[FLOW] REPORT_COMPLETED",
-        extra={
-            "event": "report.generation.completed",
-            "interview_id": str(meta.get("interview_id") or ""),
-            "fast_finalize": bool(out.get("fast_finalize")),
-            "report_ready": bool(out.get("report_ready")),
-        },
-    )
-    logger.info(
-        "interview.submitted",
-        extra={
-            "event": "interview.submitted",
-            "interview_id": str(meta.get("interview_id", "")),
-            "candidate_name": (meta.get("candidate_profile", {}) or {}).get("name", "Candidate"),
-            "final_status": final_status,
-        },
-    )
-    try:
-        if not candidate_fast_finalize:
-            sessions.pop(sk, None)
-    except Exception:
-        pass
-    return out
+        candidate_fast_finalize = bg_finalize or str((payload or {}).get("role") or "").lower() == "candidate"
+        logger.info(
+            "[FLOW] INTERVIEW_ENDED",
+            extra={"event": "interview.ended", "interview_id": str(meta.get("interview_id") or "")},
+        )
+        logger.info(
+            "[FLOW] REPORT_STARTED",
+            extra={"event": "report.generation.started", "interview_id": str(meta.get("interview_id") or "")},
+        )
+        if candidate_fast_finalize:
+            session_snapshot = copy.deepcopy(s)
+            out = _persist_fast_final_report(s, reason=reason, final_status=final_status)
+            enqueue_report_upgrade(session_snapshot, reason, final_status)
+        else:
+            out = _finalize_interview_snapshot(s, reason=reason, final_status=final_status)
+        if bg_finalize:
+            out["background_finalize"] = False
+            out["synchronous_finalize"] = True
+        logger.info(
+            "[FLOW] REPORT_COMPLETED",
+            extra={
+                "event": "report.generation.completed",
+                "interview_id": str(meta.get("interview_id") or ""),
+                "fast_finalize": bool(out.get("fast_finalize")),
+                "report_ready": bool(out.get("report_ready")),
+            },
+        )
+        logger.info(
+            "interview.submitted",
+            extra={
+                "event": "interview.submitted",
+                "interview_id": str(meta.get("interview_id", "")),
+                "candidate_name": (meta.get("candidate_profile", {}) or {}).get("name", "Candidate"),
+                "final_status": final_status,
+            },
+        )
+        try:
+            if not candidate_fast_finalize:
+                _drop_live_session(sk)
+        except Exception:
+            pass
+        return out
 
 
 def _latest_submitted_session() -> dict | None:
@@ -3915,32 +4596,20 @@ def report(request: Request, secret: str = Form(...)):
 
 @app.get("/hr-records")
 def hr_records(request: Request):
-    _, auth_err = _require_user(request, {"hr"})
+    _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _recover_interviews_once(limit=50)
-    # Prefer DB-backed interview_records so HR dropdown matches Admin dashboard.
-    snap = get_database_snapshot(AUTH_DB_TARGET, limit=1000)
-    rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
-    db_records: list[dict] = []
-    for row in rows:
-        payload = row.get("payload", None)
-        rec: dict | None = None
-        if isinstance(payload, dict):
-            rec = payload
-        elif isinstance(payload, str):
-            rec = _safe_json_loads(payload)
-        if not rec:
-            continue
-        if "id" not in rec:
-            rec["id"] = row.get("id", "")
-        db_records.append(rec)
-    if db_records:
-        return {"records": build_hr_records_summary(db_records), "source": "database"}
+    try:
+        summaries = list_recent_interview_summaries(AUTH_DB_TARGET, limit=200)
+        if summaries:
+            return {"records": build_hr_records_summary(summaries), "source": "database"}
 
-    records = load_hr_records(DATA_FILE)
-    summary = build_hr_records_summary(records)
-    return {"records": summary, "source": "records_file"}
+        records = load_hr_records(DATA_FILE)
+        summary = build_hr_records_summary(records)
+        return {"records": summary, "source": "records_file"}
+    except Exception as exc:
+        logger.exception("hr_records.failed", extra={"event": "hr_records.failed", "error": str(exc)})
+        return JSONResponse({"error": "Failed to load HR records."}, status_code=500)
 
 
 def _safe_json_loads(text: str) -> dict | None:
@@ -4017,6 +4686,21 @@ def _report_completion_status(record: dict, report: dict | None) -> str:
 def _dash_score_from_report(report: dict | None) -> int:
     r = report or {}
     ss = r.get("scoring_summary") if isinstance(r.get("scoring_summary"), dict) else None
+    if ss and ss.get("overall_score_percent") is not None:
+        try:
+            pct = float(ss["overall_score_percent"])
+            if pct >= 0:
+                return int(round(max(0.0, min(100.0, pct))))
+        except (TypeError, ValueError):
+            pass
+    reasons = r.get("score_reasons") if isinstance(r.get("score_reasons"), dict) else None
+    if reasons and isinstance(reasons.get("overall"), dict):
+        try:
+            pct = float(reasons["overall"].get("score") or 0)
+            if pct >= 0:
+                return int(round(max(0.0, min(100.0, pct))))
+        except (TypeError, ValueError):
+            pass
     if ss and ss.get("attempted_questions_only") and ss.get("mean_score_on_evaluated") is not None:
         try:
             m = float(ss["mean_score_on_evaluated"])
@@ -4057,7 +4741,7 @@ def invalidate_hr_dashboard_cache() -> None:
 
 
 @app.get("/hr/dashboard")
-def hr_dashboard(request: Request, limit: int = 500):
+def hr_dashboard(request: Request, limit: int = 200):
     """
     Dashboard-ready API that returns:
     - candidates: [{id,name,email,role,interviews:[...]}]
@@ -4068,7 +4752,7 @@ def hr_dashboard(request: Request, limit: int = 500):
         return auth_err
     hr_user = str((user or {}).get("sub", "hr")).strip().lower() or "hr"
 
-    bucket_limit = max(1, min(int(limit or 500), 1000))
+    bucket_limit = max(1, min(int(limit or 200), 500))
     role_key = str((user or {}).get("role") or "hr").lower()
     cache_key = (role_key, bucket_limit)
     if _HR_DASHBOARD_TTL_S > 0:
@@ -4077,16 +4761,29 @@ def hr_dashboard(request: Request, limit: int = 500):
             if cached and (time.monotonic() - cached[0]) < _HR_DASHBOARD_TTL_S:
                 return cached[1]
 
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
-
-    snap = get_database_snapshot(AUTH_DB_TARGET, limit=bucket_limit)
-    rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
+    try:
+        summary_rows = list_recent_interview_summaries(AUTH_DB_TARGET, limit=bucket_limit)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("hr_dashboard: list_recent_interview_summaries failed: %s", exc)
+        summary_rows = []
 
     candidates_by_key: dict[str, dict] = {}
     sessions_by_id: dict[str, dict] = {}
     template_title_cache: dict[str, str] = {}
     job_crm_cache: dict[str, dict[str, str]] = {}
+
+    job_ids = sorted({str(r.get("job_id") or "").strip() for r in summary_rows if str(r.get("job_id") or "").strip()})
+    try:
+        template_batch = get_job_template_summaries_batch(AUTH_DB_TARGET, job_ids)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("hr_dashboard: get_job_template_summaries_batch failed: %s", exc)
+        template_batch = {}
+    for jid, meta in template_batch.items():
+        template_title_cache[jid] = str(meta.get("jobTitle") or "").strip()
+        job_crm_cache[jid] = {
+            "opportunityId": str(meta.get("opportunityId") or "").strip(),
+            "customerName": str(meta.get("customerName") or "").strip(),
+        }
 
     def _template_key(record: dict, default_label: str) -> tuple[str, str]:
         """Return (templateId, templateTitle) for an interview record."""
@@ -4124,14 +4821,8 @@ def hr_dashboard(request: Request, limit: int = 500):
         if date and (not bucket.get("date") or date > str(bucket.get("date") or "")):
             bucket["date"] = date
 
-    for row in rows:
-        payload = row.get("payload", None)
-        record: dict | None = None
-        if isinstance(payload, dict):
-            record = payload
-        elif isinstance(payload, str):
-            record = _safe_json_loads(payload)
-        if not record:
+    for record in summary_rows:
+        if not isinstance(record, dict):
             continue
 
         candidate_profile = record.get("candidate_profile", {}) or {}
@@ -4139,11 +4830,11 @@ def hr_dashboard(request: Request, limit: int = 500):
         email = str(record.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
         role = str(candidate_profile.get("role_hint") or record.get("candidate_role") or record.get("role") or "Candidate").strip() or "Candidate"
 
-        key = (email.lower() if email != "Not available" else name.lower()) or "candidate"
+        rid = str(record.get("id") or "").strip()
+        key = interview_record_key(record) or rid or f"record-{len(candidates_by_key)}"
         if key not in candidates_by_key:
             candidates_by_key[key] = {"id": key, "name": name, "email": email, "role": role, "interviews": []}
 
-        rid = str(record.get("id") or row.get("id") or "").strip()
         difficulty = str(record.get("difficulty") or "Interview").strip()
         created_date = str(record.get("created_date_ist") or "").strip()
         created_at_ist = str(record.get("created_at_ist") or "").strip()
@@ -4184,7 +4875,9 @@ def hr_dashboard(request: Request, limit: int = 500):
         )
 
     # Fallback: if DB snapshot has no usable interview_records yet, use file-based HR records.
+    used_file_fallback = False
     if not candidates_by_key:
+        used_file_fallback = True
         try:
             file_records = load_hr_records(DATA_FILE)
         except Exception:
@@ -4194,11 +4887,11 @@ def hr_dashboard(request: Request, limit: int = 500):
             name = str(record.get("candidate_name") or candidate_profile.get("name") or "Candidate").strip() or "Candidate"
             email = str(record.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
             role = str(candidate_profile.get("role_hint") or record.get("candidate_role") or record.get("role") or "Candidate").strip() or "Candidate"
-            key = (email.lower() if email != "Not available" else name.lower()) or "candidate"
+            rid = str(record.get("id") or "").strip()
+            key = interview_record_key(record) or rid or f"record-{len(candidates_by_key)}"
             if key not in candidates_by_key:
                 candidates_by_key[key] = {"id": key, "name": name, "email": email, "role": role, "interviews": []}
 
-            rid = str(record.get("id") or "").strip()
             date = str(record.get("created_date_ist") or (record.get("created_at_ist") or "")[:10] or "").strip()
             report = record.get("report") if isinstance(record.get("report"), dict) else {}
             skills = record.get("skills") if isinstance(record.get("skills"), list) else []
@@ -4256,7 +4949,7 @@ def hr_dashboard(request: Request, limit: int = 500):
         entry["candidate_count"] = len(candidate_keys)
         sessions_list.append(entry)
     sessions = sorted(sessions_list, key=lambda x: (str(x.get("date") or ""), str(x.get("name") or "").lower()), reverse=True)
-    source = "database" if rows else "records_file"
+    source = "records_file" if used_file_fallback and candidates_by_key else ("database" if summary_rows else "records_file")
     payload = {"candidates": candidates, "sessions": sessions, "source": source}
     if _HR_DASHBOARD_TTL_S > 0:
         with _HR_DASHBOARD_CACHE_LOCK:
@@ -4349,7 +5042,7 @@ def _delete_interview_runtime_artifacts(interview_id: str, record: dict | None) 
             sess = sessions.get(skey) or {}
             meta = sess.get("meta", {}) or {}
             if str(meta.get("interview_id") or "").strip() == rid:
-                sessions.pop(skey, None)
+                _drop_live_session(skey)
                 removed["in_memory_sessions"] += 1
     except Exception:
         pass
@@ -4411,7 +5104,7 @@ def hr_interview_delete(request: Request, interview_id: str):
         record = find_hr_record(load_hr_records(DATA_FILE), rid)
     if not record:
         return JSONResponse({"error": "Interview record not found."}, status_code=404)
-    ok = delete_interview_record(AUTH_DB_TARGET, interview_id)
+    ok = delete_interview_record(AUTH_DB_TARGET, rid)
     removed = _delete_interview_runtime_artifacts(rid, record)
     invalidate_hr_dashboard_cache()
     return {
@@ -4572,9 +5265,47 @@ def _interview_summary_payload(record: dict) -> dict:
         "has_report": bool(report),
         "recommendation": _hr_recommendation_from_report(report),
         "summary": str(report.get("overall_summary") or report.get("summary") or report.get("feedback") or "").strip(),
-        "communication_score": int(_normalize_interview_score({"overall_score": comm.get("communication_score") or comm.get("overall_score")})),
-        "technical_score": int(_normalize_interview_score({"overall_score": report.get("technical_score") or report.get("overall_score")})),
-        "confidence_score": int(_normalize_interview_score({"overall_score": comm.get("presentation_score") or comm.get("confidence_score")})),
+        "communication_score": int(
+            _normalize_interview_score(
+                {
+                    "overall_score": (
+                        (report.get("score_reasons") or {}).get("communication", {}).get("score")
+                        if isinstance(report.get("score_reasons"), dict)
+                        else None
+                    )
+                    or report.get("communication_score")
+                    or comm.get("communication_score")
+                    or comm.get("overall_score")
+                }
+            )
+        ),
+        "technical_score": int(
+            _normalize_interview_score(
+                {
+                    "overall_score": (
+                        (report.get("score_reasons") or {}).get("technical", {}).get("score")
+                        if isinstance(report.get("score_reasons"), dict)
+                        else None
+                    )
+                    or report.get("technical_score")
+                    or report.get("overall_score")
+                }
+            )
+        ),
+        "confidence_score": int(
+            _normalize_interview_score(
+                {
+                    "overall_score": (
+                        (report.get("score_reasons") or {}).get("confidence", {}).get("score")
+                        if isinstance(report.get("score_reasons"), dict)
+                        else None
+                    )
+                    or report.get("confidence_score")
+                    or comm.get("presentation_score")
+                    or comm.get("confidence_score")
+                }
+            )
+        ),
         "strengths": [str(x) for x in (report.get("strengths") or [])][:8],
         "weaknesses": [str(x) for x in (report.get("gaps") or report.get("weaknesses") or report.get("improvements") or [])][:8],
         "skill_breakdown": _interview_skill_breakdown(record),
@@ -4657,13 +5388,25 @@ def _candidate_history_for_id(candidate_id: str) -> list[dict]:
 
 
 def _candidate_dashboard_key_from_record(rec: dict) -> str:
-    """Same candidate key as /hr/dashboard (lower email, else lower name)."""
-    if not rec:
-        return "candidate"
+    """Same candidate key as /hr/dashboard — interview_id primary, never email alone."""
+    key = interview_record_key(rec)
+    if key:
+        return key
+    return str(rec.get("id") or "").strip() or "candidate"
+
+
+def _record_matches_candidate_scope(rec: dict, candidate_id: str, interview_id: str = "") -> bool:
+    """True when candidate_id refers to this interview (primary) or legacy email/name."""
+    cid = (candidate_id or "").strip().lower()
+    if not cid:
+        return True
+    rid = str(rec.get("id") or interview_id or "").strip().lower()
+    if rid and cid == rid:
+        return True
     candidate_profile = rec.get("candidate_profile") or {}
-    email = str(rec.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
-    name = str(rec.get("candidate_name") or candidate_profile.get("name") or "Candidate").strip() or "Candidate"
-    return (email.lower() if email != "Not available" else name.lower()) or "candidate"
+    rec_email = str(rec.get("candidate_email") or candidate_profile.get("email") or "").strip().lower()
+    rec_name = str(rec.get("candidate_name") or candidate_profile.get("name") or "").strip().lower()
+    return cid in {rec_email, rec_name}
 
 
 def _primary_interview_id_for_candidate(cid: str) -> str | None:
@@ -4718,9 +5461,9 @@ def _sync_latest_interview_from_hr_decision(db_target, candidate_id: str, decisi
 @app.get("/hr/candidates/{candidate_id}/interviews")
 def hr_candidate_interviews(request: Request, candidate_id: str, limit: int = 50, offset: int = 0):
     """
-    Complete interview history for a candidate.
+    Complete interview history for a candidate interview.
 
-    - candidate_id: lower-cased email (or name fallback) used by the dashboard
+    - candidate_id: interview_id (primary dashboard key); legacy email/name still accepted
     - returns the candidate profile plus interviews newest-first, lazy-loadable via offset/limit
     """
     _, auth_err = _require_user(request, {"hr"})
@@ -4731,7 +5474,7 @@ def hr_candidate_interviews(request: Request, candidate_id: str, limit: int = 50
     if not cid:
         return JSONResponse({"error": "Candidate id is required."}, status_code=400)
 
-    records = _candidate_history_for_id(cid)
+    records = _candidate_history_for_id(candidate_id)
     if not records:
         return JSONResponse({"error": "Candidate not found."}, status_code=404)
 
@@ -4787,11 +5530,7 @@ def hr_candidate_interview_detail(request: Request, candidate_id: str, interview
         rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
     if not rec:
         return JSONResponse({"error": "Interview record not found."}, status_code=404)
-    cid = (candidate_id or "").strip().lower()
-    profile = rec.get("candidate_profile") or {}
-    rec_email = str(rec.get("candidate_email") or profile.get("email") or "").strip().lower()
-    rec_name = str(rec.get("candidate_name") or profile.get("name") or "").strip().lower()
-    if cid and cid not in {rec_email, rec_name}:
+    if not _record_matches_candidate_scope(rec, candidate_id, interview_id):
         return JSONResponse({"error": "Interview does not belong to this candidate."}, status_code=403)
     if "id" not in rec:
         rec["id"] = str(interview_id)
@@ -4834,11 +5573,7 @@ def hr_candidate_strengths_weaknesses(request: Request, candidate_id: str, inter
         rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
     if not rec:
         return JSONResponse({"error": "Interview record not found."}, status_code=404)
-    cid = (candidate_id or "").strip().lower()
-    profile = rec.get("candidate_profile") or {}
-    rec_email = str(rec.get("candidate_email") or profile.get("email") or "").strip().lower()
-    rec_name = str(rec.get("candidate_name") or profile.get("name") or "").strip().lower()
-    if cid and cid not in {rec_email, rec_name}:
+    if not _record_matches_candidate_scope(rec, candidate_id, interview_id):
         return JSONResponse({"error": "Interview does not belong to this candidate."}, status_code=403)
     report_before = rec.get("report") if isinstance(rec.get("report"), dict) else {}
     cached = bool(
@@ -4858,7 +5593,7 @@ async def hr_exclude_question_from_score(
     question_index: int,
 ):
     """Exclude one evaluated question from final score aggregates (HR moderation)."""
-    payload, auth_err = _require_user(request, {"hr"})
+    payload, auth_err = _require_hr_permission(request, "score.moderate")
     if auth_err:
         return auth_err
     try:
@@ -4874,11 +5609,7 @@ async def hr_exclude_question_from_score(
     if not rec:
         return JSONResponse({"error": "Interview record not found."}, status_code=404)
 
-    cid = (candidate_id or "").strip().lower()
-    profile = rec.get("candidate_profile") or {}
-    rec_email = str(rec.get("candidate_email") or profile.get("email") or "").strip().lower()
-    rec_name = str(rec.get("candidate_name") or profile.get("name") or "").strip().lower()
-    if cid and cid not in {rec_email, rec_name}:
+    if not _record_matches_candidate_scope(rec, candidate_id, interview_id):
         return JSONResponse({"error": "Interview does not belong to this candidate."}, status_code=403)
 
     report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
@@ -4942,6 +5673,17 @@ async def hr_exclude_question_from_score(
         pass
     invalidate_hr_dashboard_cache()
 
+    from utils.audit_log import write_audit_log
+
+    write_audit_log(
+        AUTH_DB_TARGET,
+        actor=payload,
+        action="score.exclude" if excluded else "score.include",
+        resource_type="interview_question",
+        resource_id=f"{interview_id}:{qidx}",
+        details={"reason": reason[:500], "excluded": excluded, "candidate_id": candidate_id},
+    )
+
     logger.info(
         "[SCORE] Question score inclusion updated",
         extra={
@@ -4964,6 +5706,30 @@ async def hr_exclude_question_from_score(
         "overall_score": (rec.get("report") or {}).get("overall_score"),
         "recommendation": (rec.get("report") or {}).get("recommendation"),
     }
+
+
+@app.post("/hr/reports/rescore")
+async def hr_bulk_rescore_reports(request: Request):
+    """Queue bulk AI re-evaluation for completed interview records."""
+    payload, auth_err = _require_hr_permission(request, "reports.rescore")
+    if auth_err:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_ids = body.get("interview_ids") or body.get("interviewIds") or []
+    if not isinstance(raw_ids, list):
+        return JSONResponse({"error": "interview_ids must be a list."}, status_code=400)
+    interview_ids = [str(x).strip() for x in raw_ids if str(x).strip()]
+    if not interview_ids:
+        return JSONResponse({"error": "No interview_ids provided."}, status_code=400)
+    if len(interview_ids) > 50:
+        return JSONResponse({"error": "Maximum 50 interviews per bulk rescore request."}, status_code=400)
+    backend = enqueue_bulk_rescore(interview_ids, actor=payload)
+    return {"status": "queued", "count": len(interview_ids), "job_backend": backend}
 
 
 @app.put("/hr/candidates/{candidate_id}/hr-decision")
@@ -5071,7 +5837,7 @@ def hr_candidate_delete(request: Request, candidate_id: str):
             sess_name = str((meta.get("candidate_profile") or {}).get("name") or "").strip().lower()
             iid = str(meta.get("interview_id") or "").strip()
             if sess_email == cid or sess_name == cid or (iid and iid in interview_ids):
-                sessions.pop(skey, None)
+                _drop_live_session(skey)
                 sessions_removed += 1
     except Exception:
         pass
@@ -5299,7 +6065,33 @@ async def job_config(
             "promptHistory": prompt_history_list,
         },
     )
-    return {"status": "ok", "job": job}
+    save_warning = ""
+    if _coerce_question_type(questionType) == "question_bank":
+        from services.question_bank.selection import validate_question_bank_pool
+
+        faux_job = {
+            "jobId": jobId,
+            "jobTitle": jobTitle,
+            "requiredSkills": [s.strip() for s in str(requiredSkills or "").split(",") if s.strip()],
+            "difficulty": difficulty,
+        }
+        qb_val = validate_question_bank_pool(
+            AUTH_DB_TARGET,
+            weights=weights_obj,
+            job=faux_job,
+            required_count=int(numQ or 5),
+        )
+        pool_n = int(qb_val.get("matching_after_all_filters") or 0)
+        need_n = int(qb_val.get("required_count") or numQ or 5)
+        if pool_n < need_n:
+            save_warning = (
+                f"Question Bank has {pool_n} matching question(s) for these filters but the template "
+                f"requests {need_n}. Candidates may receive fewer questions or fail to start if the pool is empty."
+            )
+    out = {"status": "ok", "job": job}
+    if save_warning:
+        out["warning"] = save_warning
+    return out
 
 
 @app.post("/job/template/sample-questions")
@@ -5496,6 +6288,141 @@ async def template_sample_questions(
     }
 
 
+def _parse_csv_bank_filter(raw: str, fallback: str, allowed: set[str]) -> list[str]:
+    parts = [s.strip().lower() for s in str(raw or "").split(",") if s.strip()]
+    if not parts and fallback:
+        parts = [str(fallback).strip().lower()]
+    return [p for p in parts if p in allowed]
+
+
+@app.post("/job/template/question-bank/preview")
+@app.post("/job/template/question-bank-preview")
+@app.post("/api/template/question-bank-preview")
+@_rl.limit("30/minute")
+async def template_question_bank_preview(
+    request: Request,
+    role: str = Form(""),
+    requiredSkills: str = Form(""),
+    optionalSkills: str = Form(""),
+    difficulty: str = Form(""),
+    difficulties: str = Form(""),
+    category: str = Form(""),
+    categories: str = Form(""),
+    questionCount: int = Form(10),
+    randomizationEnabled: str = Form("true"),
+    avoidDuplicateQuestions: str = Form("true"),
+    excludedQuestionIds: str = Form(""),
+):
+    """Preview Question Bank matches for template configuration (HR/Admin)."""
+    _, auth_err = _require_user(request, {"hr", "admin", "manager"})
+    if auth_err:
+        return auth_err
+    from services.question_bank.selection import (
+        format_question_bank_validation_error,
+        select_question_bank_for_interview,
+    )
+
+    required_list = [s.strip() for s in str(requiredSkills or "").split(",") if s.strip()]
+    optional_list = [s.strip() for s in str(optionalSkills or "").split(",") if s.strip()]
+    seen: set[str] = set()
+    skills: list[str] = []
+    for sk in required_list + optional_list:
+        key = sk.lower()
+        if key not in seen:
+            seen.add(key)
+            skills.append(sk)
+    role_line = str(role or "").strip()
+    if not role_line:
+        return JSONResponse({"error": "Target role is required for Question Bank mode."}, status_code=400)
+    if not skills:
+        return JSONResponse({"error": "At least one required skill is needed."}, status_code=400)
+
+    diff_list = _parse_csv_bank_filter(
+        difficulties, difficulty or "medium", {"easy", "medium", "hard"}
+    )
+    cat_list = _parse_csv_bank_filter(
+        categories, category or "technical", {"technical", "behavioral", "situational", "general"}
+    )
+    if not diff_list:
+        return JSONResponse({"error": "Select at least one difficulty level."}, status_code=400)
+    if not cat_list:
+        return JSONResponse({"error": "Select at least one bank category."}, status_code=400)
+
+    excluded = [s.strip() for s in str(excludedQuestionIds or "").split(",") if s.strip()]
+    count = max(1, min(int(questionCount or 10), MAX_COUNT_MODE_QUESTIONS))
+    randomize = str(randomizationEnabled or "true").strip().lower() in {"1", "true", "yes", "on"}
+
+    faux_weights = {
+        "intelligenceTargetRole": role_line,
+        "questionBankConfig": {
+            "role": role_line,
+            "skills": skills,
+            "difficulties": diff_list,
+            "categories": cat_list,
+            "difficulty": diff_list[0],
+            "category": cat_list[0],
+            "questionCount": count,
+            "randomizationEnabled": randomize,
+            "avoidDuplicateQuestions": str(avoidDuplicateQuestions or "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            "excludedQuestionIds": excluded,
+        },
+    }
+    faux_job = {"jobTitle": role_line, "requiredSkills": skills, "difficulty": diff_list[0]}
+    result = select_question_bank_for_interview(
+        AUTH_DB_TARGET,
+        weights=faux_weights,
+        job=faux_job,
+        num_q=count,
+        seed="template-preview",
+        avoid_question_texts=None,
+        allow_partial=True,
+        use_preview_fallback=False,
+        for_preview=True,
+    )
+    items = list(result.get("items") or [])
+    validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
+    pool_total = int(validation.get("matching_after_all_filters") or result.get("questions_found") or 0)
+    if not items:
+        return JSONResponse(
+            {
+                "error": format_question_bank_validation_error(validation),
+                "validation": validation,
+                "matches": [],
+                "questions": [],
+                "totalMatched": 0,
+                "poolTotal": pool_total,
+            },
+            status_code=404,
+        )
+    questions = [str(it.get("question") or "").strip() for it in items if str(it.get("question") or "").strip()]
+    matches = [
+        {
+            "id": it.get("id"),
+            "role": it.get("role") or "",
+            "skill": it.get("skill") or "",
+            "difficulty": it.get("difficulty") or "",
+            "category": it.get("category") or "",
+            "question": it.get("question") or "",
+        }
+        for it in items
+    ]
+    return {
+        "questions": questions,
+        "matches": matches,
+        "totalMatched": len(questions),
+        "poolTotal": pool_total,
+        "skillsUsed": skills,
+        "role": role_line,
+        "difficulties": diff_list,
+        "categories": cat_list,
+        "questionBankConfig": faux_weights["questionBankConfig"],
+        "validation": validation,
+        "relaxation_mode": str(result.get("relaxation_mode") or ""),
+        "partial_pool": bool(result.get("partial_pool")),
+    }
+
+
 @app.post("/job/template/prompt-preview")
 async def template_prompt_preview(
     request: Request,
@@ -5627,7 +6554,32 @@ async def template_test_prompt(
     has_ai = bool(api_key and api_key != "your_key_here")
     # Review-step preview: generate 15–20 questions so HR can sanity-check the prompt.
     test_n = max(15, min(20, int(numQ or 15)))
-    if has_ai and not safe_mode_on:
+    cache_key_payload = {
+        "skills": skills,
+        "difficulty": str(difficulty or "medium"),
+        "mode": mode,
+        "jd_head": (jdText or "")[:512],
+        "role": str(targetRole or ""),
+        "stack": str(technicalStack or ""),
+        "exp": f"{int(expMin or 0)}-{int(expMax or 0)}",
+        "model": model,
+        "prompt_sig": hashlib.sha256(effective.encode("utf-8")).hexdigest()[:20],
+        "n": test_n,
+    }
+    cache_key = response_cache.make_key("test_prompt", cache_key_payload)
+    no_cache = str(request.query_params.get("nocache") or "").lower() in {"1", "true", "yes"}
+    cached_questions: list[str] | None = None
+    if not no_cache:
+        cached_val = response_cache.get(AUTH_DB_TARGET, cache_key)
+        if isinstance(cached_val, list) and cached_val:
+            cached_questions = [str(q) for q in cached_val if str(q).strip()][:test_n]
+
+    if cached_questions and len(cached_questions) >= max(1, test_n // 2):
+        questions = cached_questions
+    elif has_ai and not safe_mode_on:
+        variety_seed = hashlib.sha256(
+            json.dumps(cache_key_payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
         q = await run_in_threadpool(
             _generate_interview_questions,
             interview_mode=mode,
@@ -5643,12 +6595,15 @@ async def template_test_prompt(
             tech_stack=str(technicalStack or ""),
             avoid_history=[],
             template_prompt=effective,
-            variety_seed=f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
+            variety_seed=variety_seed,
             template_custom=template_custom,
             validation_skills=validation_skills,
         )
+        questions = [str(item).strip() for item in (q or []) if str(item).strip()][:test_n]
+        if questions and not no_cache:
+            response_cache.set(AUTH_DB_TARGET, cache_key, "test_prompt", questions)
     elif template_custom:
-        q = []
+        questions = []
     else:
         q = await run_in_threadpool(
             generate_questions_fallback,
@@ -5658,7 +6613,7 @@ async def template_test_prompt(
             test_n,
             skills,
         )
-    questions = [str(item).strip() for item in (q or []) if str(item).strip()][:test_n]
+        questions = [str(item).strip() for item in (q or []) if str(item).strip()][:test_n]
     first = questions[0] if questions else ""
     if template_custom and not questions and has_ai and not safe_mode_on:
         return JSONResponse(
@@ -5682,11 +6637,31 @@ async def template_test_prompt(
 
 
 @app.get("/job/configs")
-def job_configs(request: Request):
+def job_configs(request: Request, jobId: str = ""):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    return {"jobs": list_job_templates(AUTH_DB_TARGET)}
+    jid = str(jobId or "").strip()
+    if jid:
+        job = get_job_template(AUTH_DB_TARGET, jid)
+        if not job:
+            return JSONResponse({"error": "Template not found."}, status_code=404)
+        return {"job": job}
+    return {"jobs": list_job_templates_summary(AUTH_DB_TARGET)}
+
+
+@app.get("/job/config/{jobId}")
+def job_config_get(request: Request, jobId: str):
+    _, auth_err = _require_user(request, {"hr", "manager", "admin"})
+    if auth_err:
+        return auth_err
+    jid = str(jobId or "").strip()
+    if not jid:
+        return JSONResponse({"error": "jobId is required."}, status_code=400)
+    job = get_job_template(AUTH_DB_TARGET, jid)
+    if not job:
+        return JSONResponse({"error": "Template not found."}, status_code=404)
+    return {"job": job}
 
 
 @app.delete("/job/config/{jobId}")
@@ -5814,7 +6789,20 @@ def candidates_ranked(request: Request, jobId: str = "", limit: int = 200):
         return {"error": "jobId is required. Configure a job first via /job/config."}
     w = AtsWeights.from_obj(cfg.get("weights") or {})
 
-    records = load_hr_records(DATA_FILE)
+    records = []
+    for row in list_recent_interview_records(AUTH_DB_TARGET, limit=max(1, min(int(limit or 200), 1000))):
+        payload = row.get("payload")
+        rec: dict | None = None
+        if isinstance(payload, dict):
+            rec = payload
+        elif isinstance(payload, str):
+            rec = _safe_json_loads(payload)
+        if not rec:
+            continue
+        if str(rec.get("job_id") or "").strip() == str(jobId or "").strip():
+            records.append(rec)
+    if not records:
+        records = load_hr_records(DATA_FILE)
     ranked = []
     for r in records[: max(1, min(int(limit or 200), 1000))]:
         answers = r.get("answers") if isinstance(r.get("answers"), list) else []
@@ -5854,14 +6842,22 @@ def candidates_ranked(request: Request, jobId: str = "", limit: int = 200):
 # ---------------------------
 
 PROCTOR_REPORT_FILE = DATA_DIR / "proctor_reports.json"
-# In-memory proctor sessions — require UVICORN_WORKERS=1 (or Redis) for multi-instance.
-_proctor_sessions: dict[str, dict] = {}
+# Proctor sessions — Redis-backed when REDIS_URL is set (see session.proctor_sessions).
 MAX_WARNINGS = 3
 _INTEGRITY_VIOLATION_TYPES = frozenset({
     "tab_switch",
     "multiple_faces",
     "proctor_tabSwitch",
     "proctor_extraFace",
+    "fullscreen_exit",
+    "key_escape",
+    "key_f11",
+    "alt_tab",
+    "windows_key",
+    "ctrl_esc",
+    "window_blur",
+    "visibility_hidden",
+    "focus_lost",
 })
 
 
@@ -5977,7 +6973,7 @@ async def proctor_start_session(
         "riskLevel": "Low",
         "terminated": False,
     }
-    _proctor_sessions[sid] = session
+    proctor_sessions[sid] = session
     return {"status": "ok", "session": session}
 
 
@@ -5992,7 +6988,7 @@ async def proctor_violation(
     if auth_err:
         return auth_err
     sid = (sessionId or "").strip()
-    sess = _proctor_sessions.get(sid)
+    sess = proctor_sessions.get(sid)
     if not sess:
         return {"error": "Invalid proctor session."}
     vtype = (type or "").strip()
@@ -6041,7 +7037,7 @@ async def proctor_end_session(
     if auth_err:
         return auth_err
     sid = (sessionId or "").strip()
-    sess = _proctor_sessions.get(sid)
+    sess = proctor_sessions.get(sid)
     if not sess:
         return {"error": "Invalid proctor session."}
     sess["ended_at_ist"] = _now_ist_parts()["ist_iso"]
@@ -6049,6 +7045,7 @@ async def proctor_end_session(
     cid = (candidateId or sess.get("candidateId") or "").strip() or "candidate"
     reports[cid] = sess
     _save_proctor_reports(reports)
+    proctor_sessions.pop(sid, None)
     payload = _decode_token_from_header(request)
     invite_tok = str((payload or {}).get("invite_token") or "").strip()
     if invite_tok:
@@ -6388,9 +7385,17 @@ def auth_login(
         },
     )
     token, expires_at_ist = _issue_access_token(user)
+    from routers.question_bank import is_super_admin
+    from utils.rbac import resolve_hr_sub_role
+
+    user_out = dict(user)
+    user_out["is_super_admin"] = is_super_admin(
+        {"sub": user.get("username", ""), "role": user.get("role", ""), "email": user.get("email", "")}
+    )
+    user_out["hr_sub_role"] = resolve_hr_sub_role(user_out, is_super_admin=user_out["is_super_admin"])
     return {
         "status": "ok",
-        "user": user,
+        "user": user_out,
         "access_token": token,
         "token_type": "bearer",
         "expires_at_ist": expires_at_ist,
@@ -6399,16 +7404,23 @@ def auth_login(
 
 @app.get("/auth/me")
 def auth_me(request: Request):
-    payload, auth_err = _require_user(request, {"hr", "candidate"})
+    payload, auth_err = _require_user(request, {"hr", "candidate", "admin", "manager"})
     if auth_err:
         return auth_err
+    from routers.question_bank import is_super_admin
+    from utils.rbac import resolve_hr_sub_role
+
+    user_payload = payload or {}
+    is_sa = is_super_admin(user_payload)
     return {
         "status": "ok",
         "user": {
-            "username": payload.get("sub", ""),
-            "role": payload.get("role", ""),
-            "full_name": payload.get("full_name", ""),
-            "email": payload.get("email", ""),
+            "username": user_payload.get("sub", ""),
+            "role": user_payload.get("role", ""),
+            "full_name": user_payload.get("full_name", ""),
+            "email": user_payload.get("email", ""),
+            "is_super_admin": is_sa,
+            "hr_sub_role": resolve_hr_sub_role(user_payload, is_super_admin=is_sa),
         },
     }
 
@@ -6534,10 +7546,17 @@ def hr_schedules(request: Request):
 
     rows = list_interview_schedules(AUTH_DB_TARGET, hr_user)
     base = _invite_base_url(request)
+    job_ids = []
     for row in rows:
         cfg = _extract_invite_config_from_notes(str(row.get("notes", "")))
         jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
-        job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+        if jid:
+            job_ids.append(jid)
+    template_map = get_job_template_summaries_batch(AUTH_DB_TARGET, job_ids)
+    for row in rows:
+        cfg = _extract_invite_config_from_notes(str(row.get("notes", "")))
+        jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+        job = template_map.get(jid) if jid else None
         job_title = str((job or {}).get("jobTitle") or "").strip()
         if jid:
             row["job_id"] = jid
@@ -6546,8 +7565,8 @@ def hr_schedules(request: Request):
             row["template_name"] = job_title
             row["role"] = job_title
         if job:
-            row["opportunityId"] = str(job.get("opportunityId") or job.get("opportunity_id") or "").strip()
-            row["customerName"] = str(job.get("customerName") or job.get("customer_name") or "").strip()
+            row["opportunityId"] = str(job.get("opportunityId") or "").strip()
+            row["customerName"] = str(job.get("customerName") or "").strip()
         token = str(row.get("invite_token") or "").strip()
         if token:
             row["invite_url"] = f"{base}/?invite={token}"
@@ -6775,20 +7794,66 @@ def candidate_invite_login(token: str, request: Request):
     candidate_name = str(record.get("candidate_name", "Candidate")).strip() or "Candidate"
     skey = f"inv:{token}"
     wait_snap = _wait_for_invite_prewarm(token, timeout_sec=12.0)
-    if sessions.get(skey):
-        boot = {"status": "ok", "session_key": skey, "reused": True, "prewarm_wait": wait_snap}
+    invite_cfg_login = _extract_invite_config_from_notes(str(record.get("notes", "")))
+    job_login = _resolve_invite_job_template(invite_cfg_login)
+    sess_check = sessions.get(skey)
+    if sess_check is not None:
+        matches_template = invite_session_matches_template(sess_check, job_login, invite_cfg_login)
+        if not matches_template and invite_session_safe_to_rebuild(sess_check):
+            logger.info(
+                "[SESSION] Stale prewarmed session discarded at login",
+                extra={
+                    "event": "session.discarded.stale_prewarm",
+                    "invite_token": _invite_token_tag(token),
+                    "expected_source": expected_question_source(job_login) if job_login else "",
+                    "actual_source": str((sess_check.get("meta") or {}).get("question_source") or ""),
+                },
+            )
+            sessions.pop(skey, None)
+            sess_check = None
+        elif not matches_template:
+            logger.warning(
+                "[SESSION] Stale prewarmed session kept at login (answers present)",
+                extra={"event": "session.reused.stale_prewarm", "invite_token": _invite_token_tag(token)},
+            )
+    if sess_check is not None and not invite_session_playable(sess_check):
+        empty_pool = not (sess_check.get("questions") or [])
+        if invite_session_safe_to_rebuild(sess_check) or empty_pool:
+            logger.info(
+                "[SESSION] Unplayable prewarmed session discarded at login",
+                extra={
+                    "event": "session.discarded.unplayable_prewarm",
+                    "invite_token": _invite_token_tag(token),
+                    "empty_pool": empty_pool,
+                },
+            )
+            sessions.pop(skey, None)
+    if sessions.get(skey) and invite_session_playable(sessions.get(skey)):
+        reused_sess = sessions.get(skey) or {}
+        boot = {
+            "status": "ok",
+            "session_key": skey,
+            "reused": True,
+            "prewarm_wait": wait_snap,
+            "question_count": len(reused_sess.get("questions") or []),
+        }
         logger.info(
             "[SESSION] Login reused prewarmed session",
             extra={"event": "interview.invite.login.reused", "invite_token": _invite_token_tag(token)},
         )
     else:
+        if sessions.get(skey):
+            sessions.pop(skey, None)
         logger.info(
             "[SESSION] Fast bootstrap starting",
             extra={"event": "interview.invite.login.fast_bootstrap", "invite_token": _invite_token_tag(token)},
         )
         boot = _bootstrap_invite_interview_session(token, record, fast_only=True)
     if boot.get("error"):
-        return JSONResponse({"error": boot["error"]}, status_code=400)
+        body = {"error": boot["error"]}
+        if isinstance(boot.get("validation"), dict):
+            body["validation"] = boot["validation"]
+        return JSONResponse(body, status_code=400)
 
     now = _now_ist_parts()
     final_device_id = device_id or active_device or f"{request.client.host}_{now['ist_time']}"
@@ -6874,7 +7939,17 @@ def interview_time_warning_audit(request: Request, warning_key: str = Form("")):
 
 
 @app.post("/interview/violation")
-def interview_violation(request: Request, violation_type: str = Form("tab_switch"), details: str = Form("")):
+def interview_violation(
+    request: Request,
+    violation_type: str = Form("tab_switch"),
+    details: str = Form(""),
+    current_question: str = Form(""),
+    fullscreen_status: str = Form(""),
+    browser_visibility: str = Form(""),
+    window_focus: str = Form(""),
+    interview_id: str = Form(""),
+    candidate_id: str = Form(""),
+):
     """Log an anti-cheating violation from the candidate's browser."""
     payload, auth_err = _require_user(request, {"candidate", "hr"})
     if auth_err:
@@ -6887,31 +7962,45 @@ def interview_violation(request: Request, violation_type: str = Form("tab_switch
     meta = s.get("meta", {})
     violations = meta.get("violations", [])
     now = _now_ist_parts()
+    vtype = str(violation_type or "tab_switch").strip() or "tab_switch"
+    invite_token = str(meta.get("invite_token", "")).strip()
+    resolved_interview_id = (interview_id or invite_token or "").strip()
+    resolved_candidate_id = (
+        candidate_id
+        or str(payload.get("sub") or payload.get("username") or payload.get("email") or "").strip()
+    )
+    focus_raw = str(window_focus or "").strip().lower()
+    window_focused = focus_raw in {"1", "true", "yes"} if focus_raw else None
     violations.append({
-        "type": violation_type,
+        "type": vtype,
         "details": (details or "")[:500],
         "timestamp": now["ist_iso"],
         "ip": str(request.client.host) if request.client else "",
         "user_agent": str(request.headers.get("user-agent", ""))[:300],
+        "interview_id": resolved_interview_id[:120],
+        "candidate_id": resolved_candidate_id[:120],
+        "current_question": (current_question or "")[:500],
+        "fullscreen_status": (fullscreen_status or "")[:32],
+        "browser_visibility": (browser_visibility or "")[:32],
+        "window_focus": window_focused,
     })
     meta["violations"] = violations
     violation_count = _count_integrity_violations(violations)
     meta["violation_count"] = violation_count
 
-    invite_token = str(meta.get("invite_token", "")).strip()
     auto_terminated = False
 
-    if violation_count > MAX_WARNINGS:
-        # Mark policy termination immediately, but leave the in-memory session
-        # answerable so the frontend can auto-save the current response before
-        # the normal /submit finalization path removes the session.
+    if violation_count >= MAX_WARNINGS:
+        # Third integrity strike terminates the interview (3-strike policy).
         meta["termination_reason"] = "Repeated interview policy violations"
         meta["terminated_at"] = now["ist_iso"]
         violations.append({
             "type": "termination",
             "reason": "Repeated interview policy violations",
-            "details": "Interview terminated due to repeated policy violations (tab switch / multiple faces)",
+            "details": "Interview Terminated - Multiple integrity violations detected",
             "timestamp": now["ist_iso"],
+            "interview_id": resolved_interview_id[:120],
+            "candidate_id": resolved_candidate_id[:120],
         })
         meta["violations"] = violations
         auto_terminated = True
@@ -6970,7 +8059,7 @@ def _termination_reason_from_events(row: dict, events: list[dict]) -> str:
         if reason:
             return reason
     policy_count = _count_integrity_violations(events)
-    if policy_count >= 4 or int(row.get("violation_count") or 0) >= 4:
+    if policy_count >= MAX_WARNINGS or int(row.get("violation_count") or 0) >= MAX_WARNINGS:
         return "Repeated interview policy violations"
     if str(row.get("session_status") or "").strip().lower() == "terminated":
         return "Interview terminated"
@@ -7069,7 +8158,7 @@ def _cleanup_expired_integrity_rows(hr_user: str) -> None:
                 "[Interview auto-closed after time limit/inactivity without a submitted response.]",
             )
         out = _finalize_interview_snapshot(sess, reason="stale_active_recovery", final_status="recovered")
-        sessions.pop(skey, None)
+        _drop_live_session(skey)
         invalidate_hr_dashboard_cache()
         logger.info(
             "interview.invite.stale_active.autofinalized",
@@ -7129,7 +8218,6 @@ def interview_integrity_logs(request: Request):
         return auth_err
     payload = _decode_token_from_header(request)
     hr_user = str((payload or {}).get("sub", "hr")).strip().lower() or "hr"
-    _recover_interviews_once(limit=50)
     _cleanup_expired_integrity_rows(hr_user)
     ttl = _integrity_logs_cache_ttl_s()
     if ttl > 0:
@@ -7137,18 +8225,30 @@ def interview_integrity_logs(request: Request):
             cached = _INTEGRITY_LOGS_CACHE.get(hr_user)
             if cached and (time.monotonic() - cached[0]) < ttl:
                 return cached[1]
-    rows = list_interview_integrity_logs(AUTH_DB_TARGET, hr_user)
+    rows = list_interview_integrity_logs(AUTH_DB_TARGET, hr_user, limit=300)
     rows = _dedupe_integrity_schedule_rows(rows)
+    job_ids = []
+    for full in rows:
+        cfg = _extract_invite_config_from_notes(str(full.get("notes", "")))
+        jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+        if jid:
+            job_ids.append(jid)
+    template_map = get_job_template_summaries_batch(AUTH_DB_TARGET, job_ids)
     logs = []
     terminated = []
     for full in rows:
-        violation_count = int(full.get("violation_count") or 0)
-        events = _parse_violations_log(full.get("violations_log"))
-        policy_violation_count = _count_integrity_violations(events)
-        tab_switch_count = sum(
-            1
-            for event in events
-            if isinstance(event, dict) and str(event.get("type") or "") in {"tab_switch", "proctor_tabSwitch"}
+        raw_log = full.get("violations_log")
+        events = _parse_violations_log(raw_log) if raw_log not in (None, "") else []
+        stored_count = int(full.get("violation_count") or 0)
+        policy_violation_count = _count_integrity_violations(events) if events else stored_count
+        tab_switch_count = (
+            sum(
+                1
+                for event in events
+                if isinstance(event, dict) and str(event.get("type") or "") in {"tab_switch", "proctor_tabSwitch"}
+            )
+            if events
+            else stored_count
         )
         extra_face_count = sum(
             1
@@ -7157,6 +8257,7 @@ def interview_integrity_logs(request: Request):
         )
         session_status = str(full.get("session_status") or "pending").strip().lower() or "pending"
         item = {
+            "invite_token": str(full.get("invite_token") or "").strip(),
             "candidate_name": full.get("candidate_name", ""),
             "candidate_email": full.get("candidate_email", ""),
             "scheduled_at": full.get("scheduled_at_local", ""),
@@ -7168,27 +8269,15 @@ def interview_integrity_logs(request: Request):
             "violation_count": policy_violation_count,
             "tab_switch_count": tab_switch_count,
             "extra_face_count": extra_face_count,
-            "violations_log": [
-                e
-                for e in events
-                if isinstance(e, dict)
-                and str(e.get("type") or "") in {
-                    "tab_switch",
-                    "multiple_faces",
-                    "proctor_tabSwitch",
-                    "proctor_extraFace",
-                    "termination",
-                }
-            ],
             "active_device_id": full.get("active_device_id", ""),
-            "reason": _termination_reason_from_events(full, events),
+            "reason": _termination_reason_from_events(full, events) if events else "",
             "template_name": "",
             "role": "",
             "terminated_at": full.get("interview_completed_at", ""),
         }
         cfg = _extract_invite_config_from_notes(str(full.get("notes", "")))
         jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
-        job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+        job = template_map.get(jid) if jid else None
         title = str((job or {}).get("jobTitle") or "").strip()
         item["template_name"] = title
         item["role"] = title
@@ -7203,6 +8292,36 @@ def interview_integrity_logs(request: Request):
     return payload_out
 
 
+@app.get("/interview/integrity-logs/{invite_token}")
+def interview_integrity_log_detail(request: Request, invite_token: str):
+    """Load violation timeline for a single session on row expand."""
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    token = str(invite_token or "").strip()
+    if not token:
+        return JSONResponse({"error": "invite_token required"}, status_code=400)
+    row = get_schedule_by_token(AUTH_DB_TARGET, token)
+    if not row:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    events = _parse_violations_log(row.get("violations_log"))
+    filtered = [
+        e
+        for e in events
+        if isinstance(e, dict)
+        and (
+            str(e.get("type") or "") in _INTEGRITY_VIOLATION_TYPES
+            or str(e.get("type") or "") == "termination"
+        )
+    ]
+    return {
+        "invite_token": token,
+        "violations_log": filtered,
+        "violation_count": _count_integrity_violations(events),
+        "reason": _termination_reason_from_events(row, events),
+    }
+
+
 # ---------------------------------------------------------------------------
 # AI Prompt Logs API (admin-only)
 # ---------------------------------------------------------------------------
@@ -7212,6 +8331,14 @@ from routers import question_bank as question_bank_router
 
 admin_router.configure(AUTH_DB_TARGET, _require_user)
 question_bank_router.configure(AUTH_DB_TARGET, _require_user)
+if not question_bank_router._super_admin_emails() and not question_bank_router._super_admin_usernames():
+    logger.warning(
+        "question_bank.super_admin.unconfigured",
+        extra={
+            "event": "question_bank.super_admin.unconfigured",
+            "hint": "Set SUPER_ADMIN_EMAILS or SUPER_ADMIN_USERNAMES in project .env",
+        },
+    )
 app.include_router(admin_router.router)
 app.include_router(question_bank_router.router)
 

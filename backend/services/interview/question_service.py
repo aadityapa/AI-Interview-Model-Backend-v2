@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _db_target() -> str:
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
+    direct = (os.getenv("AUTH_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
     if direct:
         return direct
     host = (os.getenv("DB_HOST") or "").strip()

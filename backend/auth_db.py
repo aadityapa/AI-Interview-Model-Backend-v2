@@ -221,6 +221,8 @@ def _ensure_postgres_database(dsn: str) -> None:
     host = (parsed.hostname or "").lower()
     if "supabase.com" in host or "pooler.supabase.com" in host:
         return
+    if host.endswith(".rds.amazonaws.com") or ".rds.amazonaws.com" in host:
+        return
     db_name = (parsed.path or "").lstrip("/")
     if not db_name:
         return
@@ -490,9 +492,11 @@ def _ensure_query_performance_indexes_postgres(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_interview_records_email_lower ON interview_records (LOWER(COALESCE(candidate_email, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_name_lower ON interview_records (LOWER(COALESCE(candidate_name, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_created_at_ist ON interview_records (created_at_ist DESC NULLS LAST)",
+        "CREATE INDEX IF NOT EXISTS idx_interview_records_updated_at_ist ON interview_records (COALESCE(updated_at_ist, created_at_ist) DESC NULLS LAST)",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_submitted_report ON interview_records (submitted, has_report)",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_job_id ON interview_records ((payload->>'job_id'))",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_hr_username ON interview_schedule (hr_username)",
+        "CREATE INDEX IF NOT EXISTS idx_interview_schedule_hr_created ON interview_schedule (hr_username, created_at_ist DESC NULLS LAST)",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_scheduled ON interview_schedule (scheduled_at_local DESC)",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_email_lower ON interview_schedule (LOWER(COALESCE(candidate_email, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_name_lower ON interview_schedule (LOWER(COALESCE(candidate_name, '')))",
@@ -520,9 +524,11 @@ def _ensure_query_performance_indexes_sqlite(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_interview_records_email_lower ON interview_records (LOWER(COALESCE(candidate_email, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_name_lower ON interview_records (LOWER(COALESCE(candidate_name, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_created_at_ist ON interview_records (created_at_ist DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_interview_records_updated_at_ist ON interview_records (COALESCE(updated_at_ist, created_at_ist) DESC)",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_submitted_report ON interview_records (submitted, has_report)",
         "CREATE INDEX IF NOT EXISTS idx_interview_records_job_id ON interview_records (json_extract(payload, '$.job_id'))",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_hr_username ON interview_schedule (hr_username)",
+        "CREATE INDEX IF NOT EXISTS idx_interview_schedule_hr_created ON interview_schedule (hr_username, created_at_ist DESC)",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_scheduled ON interview_schedule (scheduled_at_local DESC)",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_email_lower ON interview_schedule (LOWER(COALESCE(candidate_email, '')))",
         "CREATE INDEX IF NOT EXISTS idx_interview_schedule_name_lower ON interview_schedule (LOWER(COALESCE(candidate_name, '')))",
@@ -1261,6 +1267,76 @@ def list_job_templates(db_target: DbTarget) -> list[dict]:
     return out
 
 
+def list_job_templates_summary(db_target: DbTarget) -> list[dict]:
+    """Lightweight template list for admin grid (no prompts, JD, or history blobs)."""
+    summary_sql = """
+        SELECT job_id, job_title, domain, opportunity_id, customer_name,
+               required_skills, optional_skills, exp_min, exp_max, difficulty, num_q,
+               followup_mode, interview_mode, timing_mode, time_limit_sec,
+               mic_always_on, show_spoken_text, question_type, updated_at_ist
+        FROM job_templates
+        ORDER BY job_title ASC
+    """
+    out: list[dict] = []
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(summary_sql)
+                rows = cur.fetchall() or []
+        for r in rows:
+            out.append({
+                "jobId": r.get("job_id", ""),
+                "jobTitle": r.get("job_title", ""),
+                "domain": r.get("domain", "") or "",
+                "opportunityId": r.get("opportunity_id", "") or "",
+                "customerName": r.get("customer_name", "") or "",
+                "requiredSkills": (r.get("required_skills") or []) if isinstance(r.get("required_skills"), list) else _safe_list_json(r.get("required_skills")),
+                "optionalSkills": (r.get("optional_skills") or []) if isinstance(r.get("optional_skills"), list) else _safe_list_json(r.get("optional_skills")),
+                "expMin": int(r.get("exp_min") or 0),
+                "expMax": int(r.get("exp_max") or 0),
+                "difficulty": str(r.get("difficulty") or "medium"),
+                "numQ": int(r.get("num_q") or 5),
+                "followupMode": bool(r.get("followup_mode")) if r.get("followup_mode") is not None else False,
+                "interviewMode": _api_interview_mode(str(r.get("interview_mode") or "mock")),
+                "timingMode": str(r.get("timing_mode") or "count"),
+                "timeLimitSec": int(r.get("time_limit_sec") or 0),
+                "micAlwaysOn": bool(r.get("mic_always_on")) if r.get("mic_always_on") is not None else False,
+                "showSpokenText": bool(r.get("show_spoken_text")) if r.get("show_spoken_text") is not None else False,
+                "enableTranscriptInput": bool(r.get("show_spoken_text")) if r.get("show_spoken_text") is not None else False,
+                "questionType": _coerce_question_type(r.get("question_type")),
+                "updatedAtIst": str(r.get("updated_at_ist") or ""),
+            })
+        return out
+
+    with _connect_sqlite(Path(db_target)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(summary_sql).fetchall()
+    for r in rows:
+        out.append({
+            "jobId": r["job_id"],
+            "jobTitle": r["job_title"],
+            "domain": r["domain"] or "",
+            "opportunityId": r["opportunity_id"] if "opportunity_id" in r.keys() else "",
+            "customerName": r["customer_name"] if "customer_name" in r.keys() else "",
+            "requiredSkills": _safe_list_json(r["required_skills"]),
+            "optionalSkills": _safe_list_json(r["optional_skills"]),
+            "expMin": int(r["exp_min"] or 0),
+            "expMax": int(r["exp_max"] or 0),
+            "difficulty": str(r["difficulty"] or "medium") if "difficulty" in r.keys() else "medium",
+            "numQ": int(r["num_q"] or 5) if "num_q" in r.keys() else 5,
+            "followupMode": bool(int(r["followup_mode"] or 0)) if "followup_mode" in r.keys() else False,
+            "interviewMode": _api_interview_mode(str(r["interview_mode"] or "mock") if "interview_mode" in r.keys() else "mock"),
+            "timingMode": str(r["timing_mode"] or "count") if "timing_mode" in r.keys() else "count",
+            "timeLimitSec": int(r["time_limit_sec"] or 0) if "time_limit_sec" in r.keys() else 0,
+            "micAlwaysOn": bool(int(r["mic_always_on"] or 0)) if "mic_always_on" in r.keys() else False,
+            "showSpokenText": bool(int(r["show_spoken_text"] or 0)) if "show_spoken_text" in r.keys() else False,
+            "enableTranscriptInput": bool(int(r["show_spoken_text"] or 0)) if "show_spoken_text" in r.keys() else False,
+            "questionType": _coerce_question_type(r["question_type"] if "question_type" in r.keys() else None),
+            "updatedAtIst": str(r["updated_at_ist"] or "") if "updated_at_ist" in r.keys() else "",
+        })
+    return out
+
+
 def get_job_template(db_target: DbTarget, job_id: str) -> dict | None:
     jid = str(job_id or "").strip()
     if not jid:
@@ -1357,6 +1433,50 @@ def get_job_template(db_target: DbTarget, job_id: str) -> dict | None:
         "promptUpdatedAt": str(r["prompt_updated_at"] or "") if "prompt_updated_at" in r.keys() else "",
         "promptHistory": _safe_list_json(r["prompt_history"]) if "prompt_history" in r.keys() else [],
     })
+
+
+def get_job_template_summaries_batch(db_target: DbTarget, job_ids: list[str]) -> dict[str, dict[str, str]]:
+    """Lightweight job_id → {jobTitle, opportunityId, customerName} for list endpoints."""
+    ids = sorted({str(j or "").strip() for j in (job_ids or []) if str(j or "").strip()})
+    if not ids:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, job_title, opportunity_id, customer_name
+                    FROM job_templates
+                    WHERE job_id = ANY(%s)
+                    """,
+                    (ids,),
+                )
+                for r in cur.fetchall() or []:
+                    jid = str(r.get("job_id") or "").strip()
+                    if jid:
+                        out[jid] = {
+                            "jobTitle": str(r.get("job_title") or "").strip(),
+                            "opportunityId": str(r.get("opportunity_id") or "").strip(),
+                            "customerName": str(r.get("customer_name") or "").strip(),
+                        }
+        return out
+    placeholders = ",".join("?" for _ in ids)
+    with _connect_sqlite(Path(db_target)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT job_id, job_title, opportunity_id, customer_name FROM job_templates WHERE job_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    for r in rows:
+        jid = str(r["job_id"] or "").strip()
+        if jid:
+            out[jid] = {
+                "jobTitle": str(r["job_title"] or "").strip(),
+                "opportunityId": str(r["opportunity_id"] or "").strip() if "opportunity_id" in r.keys() else "",
+                "customerName": str(r["customer_name"] or "").strip() if "customer_name" in r.keys() else "",
+            }
+    return out
 
 
 def delete_job_template(db_target: DbTarget, job_id: str) -> bool:
@@ -1646,15 +1766,22 @@ def list_interview_records_for_candidate(
     db_target: DbTarget, candidate_id: str
 ) -> list[dict]:
     """
-    Return every interview record matching a candidate identifier.
+    Return interview record(s) for a dashboard candidate id.
 
-    The frontend uses the lower-cased candidate email (or name when email is
-    missing) as the candidate id, so we resolve both shapes here. Records are
-    returned newest-first so callers can stream the timeline directly.
+    Primary key is ``interview_id`` (one interview per dashboard row). Legacy
+    email/name lookups remain for older deep links only.
     """
-    cid = (candidate_id or "").strip().lower()
+    cid = (candidate_id or "").strip()
     if not cid:
         return []
+    direct = get_interview_record_payload(db_target, cid)
+    if isinstance(direct, dict):
+        if "id" not in direct:
+            direct = dict(direct)
+            direct["id"] = cid
+        return [direct]
+
+    cid_lower = cid.lower()
     out: list[dict] = []
     if _is_postgres(db_target):
         with _connect_postgres(str(db_target)) as conn:
@@ -1667,7 +1794,7 @@ def list_interview_records_for_candidate(
                        OR LOWER(COALESCE(candidate_name, '')) = %s
                     ORDER BY COALESCE(updated_at_ist, created_at_ist) DESC
                     """,
-                    (cid, cid),
+                    (cid_lower, cid_lower),
                 )
                 rows = cur.fetchall() or []
     else:
@@ -1681,7 +1808,7 @@ def list_interview_records_for_candidate(
                    OR LOWER(COALESCE(candidate_name, '')) = ?
                 ORDER BY COALESCE(updated_at_ist, created_at_ist) DESC
                 """,
-                (cid, cid),
+                (cid_lower, cid_lower),
             ).fetchall()
     for row in rows or []:
         payload = row["payload"] if not _is_postgres(db_target) else row.get("payload")
@@ -1896,12 +2023,22 @@ def cascade_delete_candidate(db_target: DbTarget, candidate_id: str) -> dict:
                     cur.execute("DELETE FROM hr_candidate_decisions WHERE candidate_id = %s", (cid,))
                 except Exception:
                     pass
+                cur.execute(
+                    """
+                    DELETE FROM interview_progress
+                    WHERE LOWER(COALESCE(candidate_email, '')) = %s
+                       OR LOWER(COALESCE(invite_token, '')) = %s
+                    """,
+                    (cid, cid),
+                )
+                progress_deleted = cur.rowcount or 0
             conn.commit()
         return {
             "interview_records": int(rec_deleted),
             "interview_schedule": int(sch_deleted),
             "login_data": int(login_deleted),
             "registration_data": int(reg_deleted),
+            "interview_progress": int(progress_deleted),
         }
 
     conn = _connect_sqlite(Path(db_target))
@@ -1948,6 +2085,15 @@ def cascade_delete_candidate(db_target: DbTarget, candidate_id: str) -> dict:
             cur.execute("DELETE FROM hr_candidate_decisions WHERE candidate_id = ?", (cid,))
         except sqlite3.OperationalError:
             pass
+        cur.execute(
+            """
+            DELETE FROM interview_progress
+            WHERE LOWER(COALESCE(candidate_email, '')) = ?
+               OR LOWER(COALESCE(invite_token, '')) = ?
+            """,
+            (cid, cid),
+        )
+        progress_deleted = cur.rowcount or 0
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1959,6 +2105,7 @@ def cascade_delete_candidate(db_target: DbTarget, candidate_id: str) -> dict:
         "interview_schedule": int(sch_deleted),
         "login_data": int(login_deleted),
         "registration_data": int(reg_deleted),
+        "interview_progress": int(progress_deleted),
     }
 
 
@@ -2284,8 +2431,9 @@ def create_interview_schedule(
     }
 
 
-def list_interview_schedules(db_target: DbTarget, hr_username: str) -> list[dict]:
+def list_interview_schedules(db_target: DbTarget, hr_username: str, *, limit: int = 500) -> list[dict]:
     uname = (hr_username or "hr").strip().lower()
+    cap = max(1, min(int(limit or 500), 2000))
     cols = "id, hr_username, candidate_name, candidate_email, scheduled_at_local, provider, meeting_link, invite_token, status, notes, created_date_ist, created_time_ist, access_key, session_status, violation_count"
     if _is_postgres(db_target):
         with _connect_postgres(str(db_target)) as conn:
@@ -2296,32 +2444,43 @@ def list_interview_schedules(db_target: DbTarget, hr_username: str) -> list[dict
                     FROM interview_schedule
                     WHERE hr_username = %s
                     ORDER BY created_at_ist DESC
+                    LIMIT %s
                     """,
-                    (uname,),
+                    (uname, cap),
                 )
                 rows = cur.fetchall()
         return [dict(row) for row in rows]
     with _connect_sqlite(Path(db_target)) as conn:
         try:
             rows = conn.execute(
-                f"SELECT {cols} FROM interview_schedule WHERE hr_username = ? ORDER BY created_at_ist DESC",
-                (uname,),
+                f"SELECT {cols} FROM interview_schedule WHERE hr_username = ? ORDER BY created_at_ist DESC LIMIT ?",
+                (uname, cap),
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                "SELECT id, hr_username, candidate_name, candidate_email, scheduled_at_local, provider, meeting_link, invite_token, status, notes, created_date_ist, created_time_ist FROM interview_schedule WHERE hr_username = ? ORDER BY created_at_ist DESC",
-                (uname,),
+                "SELECT id, hr_username, candidate_name, candidate_email, scheduled_at_local, provider, meeting_link, invite_token, status, notes, created_date_ist, created_time_ist FROM interview_schedule WHERE hr_username = ? ORDER BY created_at_ist DESC LIMIT ?",
+                (uname, cap),
             ).fetchall()
     return [dict(row) for row in rows]
 
 
-def list_interview_integrity_logs(db_target: DbTarget, hr_username: str) -> list[dict]:
+def list_interview_integrity_logs(
+    db_target: DbTarget,
+    hr_username: str,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    include_violations: bool = False,
+) -> list[dict]:
     """Single-query integrity payload for admin (avoids N+1 get_schedule_by_token)."""
     uname = (hr_username or "hr").strip().lower()
+    safe_limit = max(1, min(int(limit or 200), 500))
+    safe_offset = max(0, int(offset or 0))
+    violation_col = ", violations_log" if include_violations else ""
     cols = (
         "id, invite_token, status, notes, created_at_ist, candidate_name, candidate_email, scheduled_at_local, session_status, "
         "login_attempts, verified_at, interview_started_at, interview_completed_at, "
-        "violation_count, violations_log, active_device_id"
+        f"violation_count, active_device_id{violation_col}"
     )
     if _is_postgres(db_target):
         with _connect_postgres(str(db_target)) as conn:
@@ -2332,8 +2491,9 @@ def list_interview_integrity_logs(db_target: DbTarget, hr_username: str) -> list
                     FROM interview_schedule
                     WHERE hr_username = %s
                     ORDER BY scheduled_at_local DESC NULLS LAST, created_at_ist DESC
+                    LIMIT %s OFFSET %s
                     """,
-                    (uname,),
+                    (uname, safe_limit, safe_offset),
                 )
                 rows = cur.fetchall()
         return [dict(row) for row in rows]
@@ -2345,19 +2505,21 @@ def list_interview_integrity_logs(db_target: DbTarget, hr_username: str) -> list
                 FROM interview_schedule
                 WHERE hr_username = ?
                 ORDER BY scheduled_at_local DESC, created_at_ist DESC
+                LIMIT ? OFFSET ?
                 """,
-                (uname,),
+                (uname, safe_limit, safe_offset),
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, invite_token, status, notes, created_at_ist, candidate_name, candidate_email, scheduled_at_local, session_status,
-                       violation_count, violations_log
+                       violation_count, active_device_id{violation_col}
                 FROM interview_schedule
                 WHERE hr_username = ?
                 ORDER BY created_at_ist DESC
+                LIMIT ? OFFSET ?
                 """,
-                (uname,),
+                (uname, safe_limit, safe_offset),
             ).fetchall()
     return [dict(row) for row in rows]
 
@@ -2918,7 +3080,7 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT id, full_name, email, username, role, password_hash, password_salt
+                    SELECT id, full_name, email, username, role, password_hash, password_salt, hr_sub_role
                     FROM registration_data
                     WHERE username = %s OR email = %s
                     """,
@@ -2929,7 +3091,7 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
         with _connect_sqlite(Path(db_target)) as conn:
             row = conn.execute(
                 """
-                SELECT id, full_name, email, username, role, password_hash, password_salt
+                SELECT id, full_name, email, username, role, password_hash, password_salt, hr_sub_role
                 FROM registration_data
                 WHERE username = ? OR email = ?
                 """,
@@ -2952,6 +3114,16 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
         return {"success": False, "message": "Invalid username or password."}
 
     _insert_login(db_target, row["id"], uname, row["role"], 1, "Login success", now, client_ip)
+    hr_sub_role = "recruiter"
+    try:
+        if isinstance(row, dict):
+            hr_sub_role = str(row.get("hr_sub_role") or "recruiter").strip().lower()
+        else:
+            hr_sub_role = str(row["hr_sub_role"] or "recruiter").strip().lower()
+    except (KeyError, TypeError):
+        hr_sub_role = "recruiter"
+    if hr_sub_role not in {"recruiter", "hiring_manager", "super_admin"}:
+        hr_sub_role = "recruiter"
     return {
         "success": True,
         "user": {
@@ -2960,6 +3132,7 @@ def verify_login(db_target: DbTarget, username: str, password: str, client_ip: s
             "email": row["email"],
             "username": row["username"],
             "role": row["role"],
+            "hr_sub_role": hr_sub_role,
             "login_date_ist": now["ist_date"],
             "login_time_ist": now["ist_time"],
         },
@@ -3093,6 +3266,123 @@ def bulk_import_interview_records(db_target: DbTarget, records: list[dict]) -> i
     return count
 
 
+def list_recent_interview_records(db_target: DbTarget, limit: int = 500) -> list[dict[str, Any]]:
+    """Recent interview_records rows only (faster than full get_database_snapshot for HR UI)."""
+    safe_limit = max(1, min(int(limit or 500), 1000))
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, candidate_name, candidate_email, submitted, has_report,
+                           created_at_ist, updated_at_ist, payload
+                    FROM interview_records
+                    ORDER BY COALESCE(updated_at_ist, created_at_ist) DESC NULLS LAST
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+                return [dict(r) for r in (cur.fetchall() or [])]
+    with _connect_sqlite(Path(db_target)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, candidate_name, candidate_email, submitted, has_report,
+                   created_at_ist, updated_at_ist, payload
+            FROM interview_records
+            ORDER BY COALESCE(updated_at_ist, created_at_ist) DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+        return [dict(r) for r in (rows or [])]
+
+
+def count_interview_records(db_target: DbTarget) -> int:
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM interview_records")
+                row = cur.fetchone()
+                return int((row or [0])[0] or 0)
+    with _connect_sqlite(Path(db_target)) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM interview_records").fetchone()
+        return int((row or [0])[0] or 0)
+
+
+def _slim_interview_record_for_dashboard(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop heavy report Q&A from dashboard payloads while keeping score/status fields."""
+    if not isinstance(record, dict):
+        return {}
+    report = record.get("report") if isinstance(record.get("report"), dict) else {}
+    slim_report: dict[str, Any] = {}
+    if report:
+        for key in (
+            "overall_score",
+            "score",
+            "final_score",
+            "completion_status",
+            "status",
+            "report_status",
+            "technical_score",
+            "communication_score",
+        ):
+            if key in report:
+                slim_report[key] = report[key]
+    skills = record.get("skills") if isinstance(record.get("skills"), list) else []
+    profile = record.get("candidate_profile") if isinstance(record.get("candidate_profile"), dict) else {}
+    slim_profile = {
+        k: profile.get(k)
+        for k in ("name", "email", "role_hint")
+        if profile.get(k) is not None
+    }
+    return {
+        "id": record.get("id"),
+        "candidate_name": record.get("candidate_name"),
+        "candidate_email": record.get("candidate_email"),
+        "candidate_role": record.get("candidate_role"),
+        "role": record.get("role"),
+        "job_id": record.get("job_id"),
+        "difficulty": record.get("difficulty"),
+        "created_date_ist": record.get("created_date_ist"),
+        "created_at_ist": record.get("created_at_ist"),
+        "updated_at_ist": record.get("updated_at_ist"),
+        "updated_at": record.get("updated_at"),
+        "scheduled_at_local": record.get("scheduled_at_local"),
+        "invite_token": record.get("invite_token"),
+        "final_status": record.get("final_status"),
+        "report_status": record.get("report_status"),
+        "skills": skills[:25],
+        "candidate_profile": slim_profile,
+        "report": slim_report,
+    }
+
+
+def list_recent_interview_summaries(db_target: DbTarget, limit: int = 500) -> list[dict[str, Any]]:
+    """Dashboard rows with slimmed interview payloads (no full report transcripts)."""
+    rows = list_recent_interview_records(db_target, limit=limit)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload")
+        record: dict | None = None
+        if isinstance(payload, dict):
+            record = payload
+        elif isinstance(payload, str):
+            record = _safe_dict_json(payload)
+        if not record:
+            continue
+        slim = _slim_interview_record_for_dashboard(record)
+        rid = str(record.get("id") or row.get("id") or "").strip()
+        if rid:
+            slim["id"] = rid
+        slim["submitted"] = bool(row.get("submitted"))
+        slim["has_report"] = bool(row.get("has_report"))
+        slim["updated_at"] = str(row.get("updated_at_ist") or record.get("updated_at") or "")
+        slim["created_at"] = str(row.get("created_at_ist") or record.get("created_at") or "")
+        out.append(slim)
+    return out
+
+
 def get_database_snapshot(db_target: DbTarget, limit: int = 200) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or 200), 1000))
     tables = [
@@ -3139,3 +3429,85 @@ def get_database_snapshot(db_target: DbTarget, limit: int = 200) -> dict[str, An
                 rows = [dict(row) for row in conn.execute(sql, (safe_limit,)).fetchall()]
                 snapshot["tables"][table] = {"count": count, "rows": rows}
     return snapshot
+
+
+def ensure_hr_enterprise_schema(db_target: DbTarget) -> None:
+    """RBAC column + audit log table (idempotent)."""
+    from utils.audit_log import ensure_audit_log_table
+
+    ensure_audit_log_table(db_target)
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'registration_data'
+                    """
+                )
+                cols = {str(r[0]) for r in (cur.fetchall() or [])}
+                if "hr_sub_role" not in cols:
+                    cur.execute(
+                        "ALTER TABLE registration_data ADD COLUMN hr_sub_role TEXT NOT NULL DEFAULT 'recruiter'"
+                    )
+            conn.commit()
+    else:
+        with _connect_sqlite(Path(db_target)) as conn:
+            cur = conn.execute("PRAGMA table_info(registration_data)")
+            cols = {str(r[1]) for r in (cur.fetchall() or [])}
+            if "hr_sub_role" not in cols:
+                conn.execute(
+                    "ALTER TABLE registration_data ADD COLUMN hr_sub_role TEXT NOT NULL DEFAULT 'recruiter'"
+                )
+                conn.commit()
+
+
+def get_user_hr_sub_role(db_target: DbTarget, username: str) -> str:
+    uname = (username or "").strip().lower()
+    if not uname:
+        return "recruiter"
+    row = None
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT hr_sub_role, role FROM registration_data WHERE username = %s OR email = %s LIMIT 1",
+                    (uname, uname),
+                )
+                row = cur.fetchone()
+    else:
+        with _connect_sqlite(Path(db_target)) as conn:
+            row = conn.execute(
+                "SELECT hr_sub_role, role FROM registration_data WHERE username = ? OR email = ? LIMIT 1",
+                (uname, uname),
+            ).fetchone()
+    if not row:
+        return "recruiter"
+    role = str(row["hr_sub_role"] if isinstance(row, dict) else row[0] or "").strip().lower()
+    if role in {"recruiter", "hiring_manager", "super_admin"}:
+        return role
+    return "recruiter"
+
+
+def set_user_hr_sub_role(db_target: DbTarget, username: str, hr_sub_role: str) -> bool:
+    role = str(hr_sub_role or "").strip().lower()
+    if role not in {"recruiter", "hiring_manager", "super_admin"}:
+        raise ValueError("Invalid hr_sub_role")
+    uname = (username or "").strip().lower()
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE registration_data SET hr_sub_role = %s WHERE username = %s OR email = %s",
+                    (role, uname, uname),
+                )
+                ok = cur.rowcount > 0
+            conn.commit()
+            return ok
+    with _connect_sqlite(Path(db_target)) as conn:
+        cur = conn.execute(
+            "UPDATE registration_data SET hr_sub_role = ? WHERE username = ? OR email = ?",
+            (role, uname, uname),
+        )
+        conn.commit()
+        return cur.rowcount > 0
