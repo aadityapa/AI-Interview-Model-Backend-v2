@@ -2975,6 +2975,26 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=900)
 
 
+@app.middleware("http")
+async def _normalize_trailing_slash(request: Request, call_next):
+    """
+    Route "/path/" to "/path" WITHOUT an HTTP redirect.
+
+    Behind a reverse proxy (Vercel -> Render), Starlette's default trailing
+    slash redirect emits an ABSOLUTE Location using the backend's own host
+    (onrender.com). The browser then follows that cross-origin redirect and,
+    per the Fetch spec, strips the Authorization header — the API sees no token,
+    returns 401, and the SPA logs the user out. Normalizing the path in-process
+    avoids the redirect entirely so the request stays same-origin with its auth.
+    """
+    raw_path = request.scope.get("path", "") or ""
+    if len(raw_path) > 1 and raw_path.endswith("/"):
+        trimmed = raw_path.rstrip("/") or "/"
+        request.scope["path"] = trimmed
+        request.scope["raw_path"] = trimmed.encode("utf-8")
+    return await call_next(request)
+
+
 def _security_headers_enabled() -> bool:
     return str(os.getenv("SECURITY_HEADERS_ENABLED", "true")).strip().lower() not in {
         "0",
