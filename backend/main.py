@@ -649,12 +649,57 @@ def _auth_db_target() -> str:
     return str(KARNEX_DB_FILE)
 
 
-def _auth_secret() -> str:
-    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "change-me-auth-secret").strip()
+_RESOLVED_AUTH_SECRET: str | None = None
+
+
+def _env_auth_secret() -> str:
+    """Strong JWT secret explicitly provided via env (empty if unset/default)."""
+    raw = (os.getenv("AUTH_SECRET") or os.getenv("REPORT_CODE") or "").strip()
+    if not raw or raw.lower() in _default_auth_secrets():
+        return ""
     if len(raw.encode("utf-8")) >= 32:
         return raw
-    # Stabilize key length to avoid runtime JWT warning in dev/prod.
+    # Stabilize key length to avoid runtime JWT warning.
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _persistent_auth_secret() -> str:
+    """
+    Stable JWT signing secret persisted in the auth DB so it survives EVERY
+    redeploy. Render's filesystem and `generateValue` env vars are ephemeral —
+    when they rotate, all issued tokens break and users get logged out on the
+    next request. Persisting the secret in Postgres/RDS fixes that permanently.
+    Used only when no strong AUTH_SECRET/REPORT_CODE is set via the environment.
+    """
+    global _RESOLVED_AUTH_SECRET
+    if _RESOLVED_AUTH_SECRET:
+        return _RESOLVED_AUTH_SECRET
+    try:
+        from auth_db import get_app_config, set_app_config
+
+        existing = (get_app_config(AUTH_DB_TARGET, "auth_secret") or "").strip()
+        if len(existing.encode("utf-8")) >= 32:
+            _RESOLVED_AUTH_SECRET = existing
+            return existing
+        new_secret = secrets.token_urlsafe(48)
+        set_app_config(AUTH_DB_TARGET, "auth_secret", new_secret)
+        _RESOLVED_AUTH_SECRET = new_secret
+        logger.info("auth.secret.persisted", extra={"event": "auth.secret.persisted"})
+        return new_secret
+    except Exception as err:
+        logger.warning("auth.secret.persist_failed", extra={"error": str(err)[:200]})
+        return ""
+
+
+def _auth_secret() -> str:
+    env_secret = _env_auth_secret()
+    if env_secret:
+        return env_secret
+    persisted = _persistent_auth_secret()
+    if persisted:
+        return persisted
+    # Last-resort dev fallback (should never hit in production).
+    return hashlib.sha256("change-me-auth-secret".encode("utf-8")).hexdigest()
 
 
 def _token_ttl_minutes() -> int:
@@ -1006,15 +1051,12 @@ def _default_auth_secrets() -> set[str]:
 
 
 def _auth_secret_is_default() -> bool:
-    raw = (os.getenv("AUTH_SECRET") or "").strip()
-    report = (os.getenv("REPORT_CODE") or "").strip()
-    if raw and raw.lower() not in _default_auth_secrets():
+    # A strong env secret OR a DB-persisted secret both count as non-default.
+    if _env_auth_secret():
         return False
-    if report and report.lower() not in _default_auth_secrets():
+    if _persistent_auth_secret():
         return False
-    if not raw and not report:
-        return True
-    return bool(raw in _default_auth_secrets() or report in _default_auth_secrets())
+    return True
 
 
 def _allow_public_hr_registration() -> bool:

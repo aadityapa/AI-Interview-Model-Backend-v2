@@ -661,6 +661,14 @@ def init_auth_db(db_target: DbTarget) -> None:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS app_config (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
+                )
             _ensure_job_templates_columns_postgres(conn)
             _ensure_schedule_security_columns_postgres(conn)
             _ensure_interview_progress_table_postgres(conn)
@@ -776,11 +784,64 @@ def init_auth_db(db_target: DbTarget) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         _ensure_job_templates_columns_sqlite(conn)
         _ensure_schedule_security_columns_sqlite(conn)
         _ensure_interview_progress_table_sqlite(conn)
         _ensure_master_tables_sqlite(conn)
         _ensure_query_performance_indexes_sqlite(conn)
+        conn.commit()
+
+
+def get_app_config(db_target: DbTarget, key: str) -> str:
+    """Return a persisted app_config value (empty string if missing)."""
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM app_config WHERE key = %s", (key,))
+                    row = cur.fetchone()
+        else:
+            with _connect_sqlite(Path(db_target)) as conn:
+                cur = conn.execute("SELECT value FROM app_config WHERE key = ?", (key,))
+                row = cur.fetchone()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    val = row[0] if not isinstance(row, dict) else row.get("value")
+    return str(val or "")
+
+
+def set_app_config(db_target: DbTarget, key: str, value: str) -> None:
+    """Insert/update a persisted app_config value (survives redeploys)."""
+    if _is_postgres(db_target):
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO app_config (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    (key, str(value)),
+                )
+            conn.commit()
+        return
+    with _connect_sqlite(Path(db_target)) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_config (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
         conn.commit()
 
 
